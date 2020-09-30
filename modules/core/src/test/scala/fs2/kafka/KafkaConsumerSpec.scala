@@ -421,15 +421,21 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
 
         val run = for {
           consumedRef <- Ref[IO].of(Vector.empty[(String, String)])
+          shuttedDownRef <- Ref[IO].of(false)
           _ <- cons.use { consumer =>
-            consumer.stream.evalMap { msg =>
+            consumer.stream.evalTap { _ =>
+              shuttedDownRef.getAndSet(true).flatMap { prev =>
+                if (prev == false) consumer.unsubscribe else IO.unit
+              }
+            }.evalMap { msg =>
+              IO(println(msg)) >>
               consumedRef.updateAndGet(_ :+ (msg.record.key -> msg.record.value)) >> msg.offset.commit
             }.compile.drain
           }
           consumed <- consumedRef.get
         } yield consumed
 
-        val res = run.timeout(1.second).unsafeRunSync()
+        val res = run.timeout(15.seconds).unsafeRunSync()
 
         assert(res == produced)
       }
