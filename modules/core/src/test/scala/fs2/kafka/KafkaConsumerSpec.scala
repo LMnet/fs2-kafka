@@ -11,6 +11,7 @@ import net.manub.embeddedkafka.EmbeddedKafkaConfig
 import org.apache.kafka.clients.consumer.NoOffsetForPartitionException
 import org.apache.kafka.common.errors.TimeoutException
 import org.apache.kafka.common.TopicPartition
+
 import scala.collection.immutable.SortedSet
 import scala.concurrent.duration._
 
@@ -405,6 +406,32 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
           s.interruptAfter(timeoutRunTest).compile.lastOrError.unsafeRunSync()
 
         assert(closedStreams == numPartitions * 2) // should close all first streams from first consumer
+      }
+    }
+
+    it("should be able to do graceful shutdown") {
+      withKafka { (config, topic) =>
+        createCustomTopic(topic, partitions = 1)
+        val produced = (0 until 100).map(n => s"key-$n" -> s"value->$n").toVector
+        publishToKafka(topic, produced)
+
+        val cons = consumerResource[IO]
+          .using(consumerSettings[IO](config))
+          .evalTap(_.subscribeTo(topic))
+
+        val run = for {
+          consumedRef <- Ref[IO].of(Vector.empty[(String, String)])
+          _ <- cons.use { consumer =>
+            consumer.stream.evalMap { msg =>
+              consumedRef.updateAndGet(_ :+ (msg.record.key -> msg.record.value)) >> msg.offset.commit
+            }.compile.drain
+          }
+          consumed <- consumedRef.get
+        } yield consumed
+
+        val res = run.timeout(1.second).unsafeRunSync()
+
+        assert(res == produced)
       }
     }
 
