@@ -90,6 +90,7 @@ sealed abstract class KafkaConsumer[F[_], K, V] {
     */
   def partitionedStream: Stream[F, Stream[F, CommittableConsumerRecord[F, K, V]]]
 
+  // TODO: doc
   def partitionsMapStream: Stream[F, Map[TopicPartition, Stream[F, CommittableConsumerRecord[F, K, V]]]]
 
   /**
@@ -297,6 +298,9 @@ sealed abstract class KafkaConsumer[F[_], K, V] {
     timeout: FiniteDuration
   ): F[Map[TopicPartition, Long]]
 
+  // TODO: doc
+  def shutdown: F[Unit] // F[F[Unit]]?
+
   /**
     * A `Fiber` that can be used to cancel the underlying consumer, or
     * wait for it to complete. If you're using [[stream]], or any other
@@ -399,6 +403,16 @@ private[kafka] object KafkaConsumer {
           }, polls.cancel)
 
         actorFiber combine pollsFiber
+      }
+
+      override def shutdown: F[Unit] = {
+        // We can't interrupt stream though, so we would have to
+        // (1) complete all outstanding fetch requests,
+        // (2) make sure all fetch requests on the queue get completed,
+        // (3) ensure no new requests are put on the queue,
+        // (4) stop the internal actor and scheduling of polls.
+        
+        ???
       }
 
       override def partitionsMapStream: Stream[F, Map[TopicPartition, Stream[F, CommittableConsumerRecord[F, K, V]]]] = {
