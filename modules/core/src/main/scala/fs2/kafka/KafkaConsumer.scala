@@ -20,7 +20,9 @@ import fs2.kafka.internal.instances._
 import fs2.kafka.internal.KafkaConsumerActor._
 import fs2.kafka.internal.syntax._
 import java.util
+
 import org.apache.kafka.common.{Metric, MetricName, PartitionInfo, TopicPartition}
+
 import scala.collection.immutable.SortedSet
 import scala.concurrent.duration.FiniteDuration
 import scala.util.matching.Regex
@@ -298,9 +300,6 @@ sealed abstract class KafkaConsumer[F[_], K, V] {
     timeout: FiniteDuration
   ): F[Map[TopicPartition, Long]]
 
-  // TODO: doc
-  def shutdown: F[Unit] // F[F[Unit]]?
-
   /**
     * A `Fiber` that can be used to cancel the underlying consumer, or
     * wait for it to complete. If you're using [[stream]], or any other
@@ -386,7 +385,8 @@ private[kafka] object KafkaConsumer {
     polls: Fiber[F, Unit],
     streamIdRef: Ref[F, StreamId],
     id: Int,
-    withConsumer: WithConsumer[F]
+    withConsumer: WithConsumer[F],
+    shutdownControl: F[F[Unit]]
   )(implicit F: Concurrent[F]): KafkaConsumer[F, K, V] =
     new KafkaConsumer[F, K, V] {
       override val fiber: Fiber[F, Unit] = {
@@ -403,16 +403,6 @@ private[kafka] object KafkaConsumer {
           }, polls.cancel)
 
         actorFiber combine pollsFiber
-      }
-
-      override def shutdown: F[Unit] = {
-        // We can't interrupt stream though, so we would have to
-        // (1) complete all outstanding fetch requests,
-        // (2) make sure all fetch requests on the queue get completed,
-        // (3) ensure no new requests are put on the queue,
-        // (4) stop the internal actor and scheduling of polls.
-        
-        ???
       }
 
       override def partitionsMapStream: Stream[F, Map[TopicPartition, Stream[F, CommittableConsumerRecord[F, K, V]]]] = {
@@ -828,8 +818,8 @@ private[kafka] object KafkaConsumer {
     implicit F: ConcurrentEffect[F],
     context: ContextShift[F],
     timer: Timer[F]
-  ): Resource[F, KafkaConsumer[F, K, V]] =
-    for {
+  ): Resource[F, KafkaConsumer[F, K, V]] = {
+    val resource = for {
       keyDeserializer <- Resource.liftF(settings.keyDeserializer)
       valueDeserializer <- Resource.liftF(settings.valueDeserializer)
       id <- Resource.liftF(F.delay(new Object().hashCode))
@@ -850,5 +840,22 @@ private[kafka] object KafkaConsumer {
       )
       actor <- startConsumerActor(requests, polls, actor)
       polls <- startPollScheduler(polls, settings.pollInterval)
-    } yield createKafkaConsumer(requests, settings, actor, polls, streamId, id, withConsumer)
+      shutdownControl <- Resource.liftF(Deferred[F, F[Unit]]) // TODO: Option
+    } yield {
+      val consumer =
+        createKafkaConsumer(requests, settings, actor, polls, streamId, id, withConsumer, shutdownControl.get)
+      (consumer, shutdownControl)
+    }
+
+    Resource.make(resource.allocated) { case ((_, shutdownControl), closeConsumer) =>
+      for {
+        shutdownWaiter <- Deferred[F, Unit]
+        _ <- shutdownControl.complete(shutdownWaiter.complete(()))
+        _ <- shutdownWaiter.get
+        _ <- closeConsumer
+      } yield ()
+    }.map { case ((consumer, _), _) =>
+      consumer
+    }
+  }
 }
