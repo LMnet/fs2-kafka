@@ -13,7 +13,7 @@ import cats.effect.concurrent.{Deferred, Ref}
 import cats.effect.implicits._
 import cats.implicits._
 import fs2.{Chunk, Stream}
-import fs2.concurrent.Queue
+import fs2.concurrent.{NoneTerminatedQueue, Queue}
 import fs2.kafka.internal._
 import fs2.kafka.internal.converters.collection._
 import fs2.kafka.internal.instances._
@@ -386,10 +386,10 @@ private[kafka] object KafkaConsumer {
     streamIdRef: Ref[F, StreamId],
     id: Int,
     withConsumer: WithConsumer[F],
-    shutdownControl: F[F[Unit]]
+    shutdownStarted: F[Unit]
   )(implicit F: Concurrent[F]): KafkaConsumer[F, K, V] =
     new KafkaConsumer[F, K, V] {
-      override val fiber: Fiber[F, Unit] = {
+      override val fiber: Fiber[F, Unit] = { // TODO: найти все использования и просмотреть
         val actorFiber =
           Fiber[F, Unit](F.guaranteeCase(actor.join) {
             case ExitCase.Completed => polls.cancel
@@ -413,7 +413,7 @@ private[kafka] object KafkaConsumer {
           (Chunk[CommittableConsumerRecord[F, K, V]], FetchCompletedReason)
 
         type PartitionsMap = Map[TopicPartition, Stream[F, CommittableConsumerRecord[F, K, V]]]
-        type PartitionsMapQueue = Queue[F, PartitionsMap]
+        type PartitionsMapQueue = NoneTerminatedQueue[F, PartitionsMap]
 
         def createPartitionStream(
           streamId: StreamId,
@@ -423,7 +423,7 @@ private[kafka] object KafkaConsumer {
           for {
             chunks <- chunkQueue
             dequeueDone <- Deferred[F, Unit]
-            shutdown = F.race(fiber.join.attempt, dequeueDone.get).void
+            shutdown = F.race(F.race(fiber.join.attempt, dequeueDone.get), shutdownStarted).void
             stopReqs <- Deferred.tryable[F, Unit]
           } yield Stream.eval {
             def fetchPartition(deferred: Deferred[F, PartitionRequest]): F[Unit] = {
@@ -471,7 +471,10 @@ private[kafka] object KafkaConsumer {
                 chunks.dequeue.unNoneTerminate
                   .flatMap(Stream.chunk)
                   .covary[F]
-                  .onFinalize(dequeueDone.complete(()))
+                  .onFinalize {
+                    dequeueDone.complete(()) >>
+                      requests.enqueue1(Request.PartitionStreamFinalized(partition, partitionStreamId))
+                  }
               }
           }.flatten
         }
@@ -483,7 +486,7 @@ private[kafka] object KafkaConsumer {
           partitionsMapQueue: PartitionsMapQueue,
         ): F[Unit] = {
           if (assigned.isEmpty) {
-            partitionsMapQueue.enqueue1(Map.empty)
+            partitionsMapQueue.enqueue1(Some(Map.empty))
           } else {
             val indexedAssigned = assigned.toVector.zipWithIndex
             partitionStreamIdRef.modify { id =>
@@ -499,7 +502,7 @@ private[kafka] object KafkaConsumer {
                 }
               }.map(_.toMap)
             }.flatMap { assignment: PartitionsMap =>
-              partitionsMapQueue.enqueue1(assignment)
+              partitionsMapQueue.enqueue1(Some(assignment))
             }
           }
         }
@@ -542,11 +545,16 @@ private[kafka] object KafkaConsumer {
           }
 
         for {
-          partitionsMapQueue <- Stream.eval(Queue.unbounded[F, PartitionsMap])
+          partitionsMapQueue <- Stream.eval(Queue.noneTerminated[F, PartitionsMap])
           streamId <- Stream.eval(streamIdRef.modify(n => (n + 1, n)))
           partitionStreamIdRef <- Stream.eval(Ref.of[F, PartitionStreamId](0))
+          _ <- Stream.eval(requests.enqueue1(Request.StreamStarted(streamId)))
           _ <- Stream.eval(initialEnqueue(streamId, partitionsMapQueue, partitionStreamIdRef))
-          out <- partitionsMapQueue.dequeue.interruptWhen(fiber.join.attempt)
+          out <- partitionsMapQueue.dequeue.interruptWhen(fiber.join.attempt).concurrently(
+            Stream.eval(shutdownStarted >> partitionsMapQueue.enqueue1(None))
+          ).onFinalize {
+            requests.enqueue1(Request.StreamFinalized(streamId))
+          }
         } yield out
       }
 
@@ -585,7 +593,7 @@ private[kafka] object KafkaConsumer {
           )
         }
 
-      override def assignmentStream: Stream[F, SortedSet[TopicPartition]] = {
+      override def assignmentStream: Stream[F, SortedSet[TopicPartition]] = { // TODO: ?
         // NOTE: `initialAssignmentDone` is needed here to guard against the
         // race condition when a rebalance triggers after the listeners are
         // registered but before `assignmentRef` can be updated with initial
@@ -840,21 +848,22 @@ private[kafka] object KafkaConsumer {
       )
       actor <- startConsumerActor(requests, polls, actor)
       polls <- startPollScheduler(polls, settings.pollInterval)
-      shutdownControl <- Resource.liftF(Deferred[F, F[Unit]]) // TODO: Option
+      shutdownStarter <- Resource.liftF(Deferred[F, Unit])
     } yield {
       val consumer =
-        createKafkaConsumer(requests, settings, actor, polls, streamId, id, withConsumer, shutdownControl.get)
-      (consumer, shutdownControl)
+        createKafkaConsumer(requests, settings, actor, polls, streamId, id, withConsumer, shutdownStarter.get.void)
+      (consumer, requests, shutdownStarter)
     }
 
-    Resource.make(resource.allocated) { case ((_, shutdownControl), closeConsumer) =>
+    Resource.make(resource.allocated) { case ((_, requests, shutdownStarter), closeConsumer) =>
       for {
         shutdownWaiter <- Deferred[F, Unit]
-        _ <- shutdownControl.complete(shutdownWaiter.complete(()))
+        _ <- shutdownStarter.complete(())
+        _ <- requests.enqueue1(Request.ShutdownStarted(shutdownWaiter.complete(())))
         _ <- shutdownWaiter.get
         _ <- closeConsumer
       } yield ()
-    }.map { case ((consumer, _), _) =>
+    }.map { case ((consumer, _, _), _) =>
       consumer
     }
   }

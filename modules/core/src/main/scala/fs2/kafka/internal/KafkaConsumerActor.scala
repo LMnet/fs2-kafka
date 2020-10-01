@@ -21,13 +21,9 @@ import fs2.kafka.internal.syntax._
 import java.time.Duration
 import java.util
 import java.util.regex.Pattern
-import org.apache.kafka.clients.consumer.{
-  ConsumerConfig,
-  ConsumerRebalanceListener,
-  OffsetAndMetadata,
-  OffsetCommitCallback
-}
+import org.apache.kafka.clients.consumer.{ConsumerConfig, ConsumerRebalanceListener, OffsetAndMetadata, OffsetCommitCallback}
 import org.apache.kafka.common.TopicPartition
+
 import scala.collection.immutable.SortedSet
 
 /**
@@ -230,7 +226,7 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
   }
 
   private[this] def commit(request: Request.Commit[F, K, V]): F[Unit] =
-    ref.get.flatMap { state =>
+    ref.get.flatMap { state => // TODO: неправильное использование ref
       if (state.rebalancing) {
         ref
           .updateAndGet(_.withPendingCommit(request))
@@ -476,6 +472,32 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
     }
   }
 
+  private[this] def partitionStreamFinalized(
+    partition: TopicPartition,
+    partitionStreamId: PartitionStreamId
+  ): F[Unit] = {
+    ref.updateAndGet(_.withoutPartitionStream(partition, partitionStreamId)) >>= tryToCompleteShutdown
+  }
+
+  private[this] def streamStarted(streamId: StreamId): F[Unit] = {
+    ref.updateAndGet(_.withStream(streamId)).void
+  }
+
+  private[this] def streamFinalized(streamId: StreamId): F[Unit] = {
+    ref.updateAndGet(_.withoutStream(streamId)) >>= tryToCompleteShutdown
+  }
+
+  private[this] def shutdownStarted(shutdownCompleter: F[Unit]): F[Unit] = {
+    ref.updateAndGet(_.withShutdownStarted(shutdownCompleter)) >>= tryToCompleteShutdown
+  }
+
+  private[this] def tryToCompleteShutdown(state: State[F, K, V]): F[Unit] = {
+    state.shutdownCompleter match {
+      case Some(shutdownCompleter) => if (state.allStreamsFinalized) shutdownCompleter else F.unit
+      case None => F.unit
+    }
+  }
+
   def handle(request: Request[F, K, V]): F[Unit] =
     request match {
       case Request.Assignment(deferred, onRebalance)   => assignment(deferred, onRebalance)
@@ -487,6 +509,11 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
       case Request.Fetch(partition, streamId, partitionStreamId, deferred) =>
         fetch(partition, streamId, partitionStreamId, deferred)
       case request @ Request.Commit(_, _) => commit(request)
+      case Request.PartitionStreamFinalized(partition, partitionStreamId) =>
+        partitionStreamFinalized(partition, partitionStreamId)
+      case Request.StreamStarted(streamId) => streamStarted(streamId)
+      case Request.StreamFinalized(streamId) => streamFinalized(streamId)
+      case Request.ShutdownStarted(shutdownCompleter) => shutdownStarted(shutdownCompleter)
     }
 }
 
@@ -509,13 +536,15 @@ private[kafka] object KafkaConsumerActor {
 
   final case class State[F[_], K, V](
     fetches: Map[TopicPartition, Map[StreamId, FetchRequest[F, K, V]]],
+    streamIds: Set[StreamId],
     partitionStreamIds: Map[TopicPartition, PartitionStreamId],
     records: Map[TopicPartition, NonEmptyVector[CommittableConsumerRecord[F, K, V]]],
     pendingCommits: Chain[Request.Commit[F, K, V]],
     onRebalances: Chain[OnRebalance[F, K, V]],
     rebalancing: Boolean,
     subscribed: Boolean,
-    streaming: Boolean
+    streaming: Boolean,
+    shutdownCompleter: Option[F[Unit]]
   ) {
     def withOnRebalance(onRebalance: OnRebalance[F, K, V]): State[F, K, V] =
       copy(onRebalances = onRebalances append onRebalance)
@@ -582,6 +611,23 @@ private[kafka] object KafkaConsumerActor {
         records = records.filterKeysStrict(!partitions.contains(_))
       )
 
+    def withoutPartitionStream(
+      partition: TopicPartition,
+      partitionStreamId: PartitionStreamId
+    ): State[F, K, V] = {
+      val partitionStreamIdInState = partitionStreamIds.get(partition)
+
+      if (partitionStreamIdInState.contains(partitionStreamId)) {
+        copy(partitionStreamIds = partitionStreamIds.removed(partition))
+      } else this
+    }
+
+    def withStream(streamId: StreamId): State[F, K, V] =
+      copy(streamIds = streamIds + streamId)
+
+    def withoutStream(streamId: StreamId): State[F, K, V] =
+      copy(streamIds = streamIds - streamId)
+
     def withoutRecords(partitions: Set[TopicPartition]): State[F, K, V] =
       copy(records = records.filterKeysStrict(!partitions.contains(_)))
 
@@ -594,6 +640,9 @@ private[kafka] object KafkaConsumerActor {
     def withRebalancing(rebalancing: Boolean): State[F, K, V] =
       if (this.rebalancing == rebalancing) this else copy(rebalancing = rebalancing)
 
+    def withShutdownStarted(shutdownCompleter: F[Unit]): State[F, K, V] =
+      copy(shutdownCompleter = Some(shutdownCompleter))
+
     def asSubscribed: State[F, K, V] =
       if (subscribed) this else copy(subscribed = true)
 
@@ -603,7 +652,9 @@ private[kafka] object KafkaConsumerActor {
     def asStreaming: State[F, K, V] =
       if (streaming) this else copy(streaming = true)
 
-    override def toString: String = {
+    def allStreamsFinalized: Boolean = streamIds.isEmpty && partitionStreamIds.isEmpty
+
+    override def toString: String = { // TODO
       val fetchesString =
         fetches.toList
           .sortBy { case (tp, _) => tp }
@@ -633,12 +684,14 @@ private[kafka] object KafkaConsumerActor {
       State(
         fetches = Map.empty,
         partitionStreamIds = Map.empty,
+        streamIds = Set.empty,
         records = Map.empty,
         pendingCommits = Chain.empty,
         onRebalances = Chain.empty,
         rebalancing = false,
         subscribed = false,
-        streaming = false
+        streaming = false,
+        shutdownCompleter = false
       )
   }
 
@@ -708,6 +761,23 @@ private[kafka] object KafkaConsumerActor {
     final case class Commit[F[_], K, V](
       offsets: Map[TopicPartition, OffsetAndMetadata],
       deferred: Deferred[F, Either[Throwable, Unit]]
+    ) extends Request[F, K, V]
+
+    final case class ShutdownStarted[F[_], K, V](
+      shutdownCompleted: F[Unit]
+    ) extends Request[F, K, V]
+
+    final case class PartitionStreamFinalized[F[_], K, V](
+      partition: TopicPartition,
+      partitionStreamId: PartitionStreamId
+    ) extends Request[F, K, V]
+
+    final case class StreamStarted[F[_], K, V](
+      streamId: PartitionStreamId
+    ) extends Request[F, K, V]
+
+    final case class StreamFinalized[F[_], K, V](
+      streamId: PartitionStreamId
     ) extends Request[F, K, V]
   }
 }
