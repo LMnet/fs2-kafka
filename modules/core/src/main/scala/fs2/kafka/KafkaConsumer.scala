@@ -389,7 +389,7 @@ private[kafka] object KafkaConsumer {
     shutdownStarted: F[Unit]
   )(implicit F: Concurrent[F]): KafkaConsumer[F, K, V] =
     new KafkaConsumer[F, K, V] {
-      override val fiber: Fiber[F, Unit] = { // TODO: найти все использования и просмотреть
+      override val fiber: Fiber[F, Unit] = {
         val actorFiber =
           Fiber[F, Unit](F.guaranteeCase(actor.join) {
             case ExitCase.Completed => polls.cancel
@@ -593,7 +593,7 @@ private[kafka] object KafkaConsumer {
           )
         }
 
-      override def assignmentStream: Stream[F, SortedSet[TopicPartition]] = { // TODO: ?
+      override def assignmentStream: Stream[F, SortedSet[TopicPartition]] = {
         // NOTE: `initialAssignmentDone` is needed here to guard against the
         // race condition when a rebalance triggers after the listeners are
         // registered but before `assignmentRef` can be updated with initial

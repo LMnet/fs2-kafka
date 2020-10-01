@@ -691,7 +691,7 @@ private[kafka] object KafkaConsumerActor {
         rebalancing = false,
         subscribed = false,
         streaming = false,
-        shutdownCompleter = false
+        shutdownCompleter = None
       )
   }
 
