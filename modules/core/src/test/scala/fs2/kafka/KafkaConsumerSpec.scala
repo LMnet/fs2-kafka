@@ -506,7 +506,7 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
       }
     }
 
-    it("should interrupt the stream when cancelled") {
+    it("should interrupt the stream when cancelled") { // TODO: add test with graceful shutdown
       withKafka { (config, topic) =>
         val consumed =
           consumerStream[IO]
