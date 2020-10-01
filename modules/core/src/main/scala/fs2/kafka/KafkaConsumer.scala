@@ -848,22 +848,34 @@ private[kafka] object KafkaConsumer {
       )
       actor <- startConsumerActor(requests, polls, actor)
       polls <- startPollScheduler(polls, settings.pollInterval)
-      shutdownStarter <- Resource.liftF(Deferred[F, Unit])
+      shutdownStarter <- Resource.liftF(settings.gracefulShutdownTimeout.traverse { gracefulShutdownTimeout =>
+        Deferred[F, Unit].map(deferred => (deferred, gracefulShutdownTimeout))
+      })
     } yield {
+      val shutdownStarted: F[Unit] = shutdownStarter.map { case (deferred, _) =>
+        deferred.get
+      }.getOrElse(F.never)
+
       val consumer =
-        createKafkaConsumer(requests, settings, actor, polls, streamId, id, withConsumer, shutdownStarter.get.void)
-      (consumer, requests, shutdownStarter)
+        createKafkaConsumer(requests, settings, actor, polls, streamId, id, withConsumer, shutdownStarted)
+
+      (consumer, requests, shutdownStarter, logging)
     }
 
-    Resource.make(resource.allocated) { case ((_, requests, shutdownStarter), closeConsumer) =>
-      for {
-        shutdownWaiter <- Deferred[F, Unit]
-        _ <- shutdownStarter.complete(())
-        _ <- requests.enqueue1(Request.ShutdownStarted(shutdownWaiter.complete(())))
-        _ <- shutdownWaiter.get
-        _ <- closeConsumer
-      } yield ()
-    }.map { case ((consumer, _, _), _) =>
+    Resource.make(resource.allocated) { case ((_, requests, shutdownStarter, logging), closeConsumer) =>
+      shutdownStarter match {
+        case None => closeConsumer
+        case Some((shutdownStarterDeferred, shutdownTimeout)) =>
+          for {
+            shutdownWaiter <- Deferred[F, Unit]
+            _ <- shutdownStarterDeferred.complete(())
+            _ <- requests.enqueue1(Request.ShutdownStarted(shutdownWaiter.complete(())))
+            _ <- shutdownWaiter.get
+              .timeoutTo(shutdownTimeout, logging.log(LogEntry.GracefulShutdownInterruptedByTimeout(shutdownTimeout)))
+            _ <- closeConsumer
+          } yield ()
+      }
+    }.map { case ((consumer, _, _, _), _) =>
       consumer
     }
   }

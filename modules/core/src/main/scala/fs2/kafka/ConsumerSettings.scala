@@ -397,6 +397,14 @@ sealed abstract class ConsumerSettings[F[_], K, V] {
     * instead be set to `2` and not the specified value.
     */
   def withMaxPrefetchBatches(maxPrefetchBatches: Int): ConsumerSettings[F, K, V]
+
+  def gracefulShutdownTimeout: Option[FiniteDuration]
+
+  final def gracefulShutdownEnabled: Boolean = gracefulShutdownTimeout.isDefined
+
+  def withGracefulShutdown(timeout: FiniteDuration): ConsumerSettings[F, K, V]
+
+  def withoutGracefulShutdown: ConsumerSettings[F, K, V]
 }
 
 object ConsumerSettings {
@@ -412,7 +420,8 @@ object ConsumerSettings {
     override val commitRecovery: CommitRecovery,
     override val recordMetadata: ConsumerRecord[K, V] => String,
     override val maxPrefetchBatches: Int,
-    val createConsumerWith: Map[String, String] => F[KafkaByteConsumer]
+    override val gracefulShutdownTimeout: Option[FiniteDuration],
+    createConsumerWith: Map[String, String] => F[KafkaByteConsumer]
   ) extends ConsumerSettings[F, K, V] {
     override def withBlocker(blocker: Blocker): ConsumerSettings[F, K, V] =
       copy(blocker = Some(blocker))
@@ -534,6 +543,12 @@ object ConsumerSettings {
 
     override def withMaxPrefetchBatches(maxPrefetchBatches: Int): ConsumerSettings[F, K, V] =
       copy(maxPrefetchBatches = Math.max(2, maxPrefetchBatches))
+
+    override def withGracefulShutdown(timeout: FiniteDuration): ConsumerSettings[F, K, V] =
+      copy(gracefulShutdownTimeout = Some(timeout))
+
+    override def withoutGracefulShutdown: ConsumerSettings[F, K, V] =
+      copy(gracefulShutdownTimeout = None)
 
     override def toString: String =
       s"ConsumerSettings(closeTimeout = $closeTimeout, commitTimeout = $commitTimeout, pollInterval = $pollInterval, pollTimeout = $pollTimeout, commitRecovery = $commitRecovery)"
