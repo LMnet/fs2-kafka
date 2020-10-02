@@ -462,6 +462,7 @@ private[kafka] object KafkaConsumer {
                       F.unit
                   }
                 }
+                .concurrently(Stream.eval(shutdownStarted >> stopReqs.complete(()).attempt))
                 .interruptWhen(F.race(shutdown, stopReqs.get).void.attempt)
                 .compile
                 .drain

@@ -433,7 +433,7 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
             consumer.stream.evalMap { msg =>
               receivedFirst.complete(()).attempt >>
                 consumedRef.updateAndGet(_ :+ (msg.record.key -> msg.record.value)) >> msg.offset.commit
-            }.compile.drain
+            }.compile.drain.uncancelable
           }
           fiber <- runStream.start
           _ <- receivedFirst.get
@@ -444,7 +444,7 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
 
         val (consumed, shutdownResult) = run.timeout(15.seconds).unsafeRunSync()
 
-        assert(consumed == produced && shutdownResult.contains(GracefulShutdownResult.Success))
+        assert(shutdownResult.contains(GracefulShutdownResult.Success) && consumed == produced)
       }
     }
 

@@ -675,7 +675,7 @@ private[kafka] object KafkaConsumerActor {
               append(id.toString)
           }("", ", ", "")
 
-      s"State(fetches = Map($fetchesString), partitionStreamIds = Map($partitionStreamIdsString), records = Map(${recordsString(records)}), pendingCommits = $pendingCommits, onRebalances = $onRebalances, rebalancing = $rebalancing, subscribed = $subscribed, streaming = $streaming)"
+      s"State(fetches = Map($fetchesString), partitionStreamIds = Map($partitionStreamIdsString), streamIds = $streamIds, records = Map(${recordsString(records)}), pendingCommits = $pendingCommits, onRebalances = $onRebalances, rebalancing = $rebalancing, subscribed = $subscribed, streaming = $streaming)"
     }
   }
 
