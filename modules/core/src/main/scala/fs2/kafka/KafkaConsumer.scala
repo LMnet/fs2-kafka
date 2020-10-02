@@ -827,36 +827,12 @@ private[kafka] object KafkaConsumer {
   }
 
   def consumerResource[F[_], K, V](
-    settings: ConsumerSettings[F, K, V],
+    settings: ConsumerSettings[F, K, V]
   )(
     implicit F: ConcurrentEffect[F],
     context: ContextShift[F],
     timer: Timer[F]
   ): Resource[F, KafkaConsumer[F, K, V]] = {
-    consumerResourceImpl(settings, None).map { case (consumer, _) =>
-      consumer
-    }
-  }
-
-  def consumerResourceWithGracefulShutdown[F[_], K, V](
-    settings: ConsumerSettings[F, K, V],
-    gracefulShutdownTimeout: FiniteDuration,
-  )(
-    implicit F: ConcurrentEffect[F],
-    context: ContextShift[F],
-    timer: Timer[F]
-  ): Resource[F, (KafkaConsumer[F, K, V], F[GracefulShutdownResult])] = {
-    consumerResourceImpl(settings, Some(gracefulShutdownTimeout))
-  }
-
-  private def consumerResourceImpl[F[_], K, V](
-    settings: ConsumerSettings[F, K, V],
-    gracefulShutdownTimeout: Option[FiniteDuration],
-  )(
-    implicit F: ConcurrentEffect[F],
-    context: ContextShift[F],
-    timer: Timer[F]
-  ): Resource[F, (KafkaConsumer[F, K, V], F[GracefulShutdownResult])] = {
     val resource = for {
       keyDeserializer <- Resource.liftF(settings.keyDeserializer)
       valueDeserializer <- Resource.liftF(settings.valueDeserializer)
@@ -878,46 +854,55 @@ private[kafka] object KafkaConsumer {
       )
       actor <- startConsumerActor(requests, polls, actor)
       polls <- startPollScheduler(polls, settings.pollInterval)
-      shutdownStarter <- Resource.liftF(gracefulShutdownTimeout.traverse { gracefulShutdownTimeout =>
-        for {
-          shutdownStarted <- Deferred[F, Unit]
-          shutdownCompleted <- Deferred[F, GracefulShutdownResult]
-        } yield (shutdownStarted, shutdownCompleted, gracefulShutdownTimeout)
+      shutdownControl <- Resource.liftF(settings.gracefulShutdownSettings.traverse { gracefulShutdownSettings =>
+        Deferred[F, Unit].map(deferred => (deferred, gracefulShutdownSettings))
       })
     } yield {
-      val shutdownStarted: F[Unit] = shutdownStarter.map { case (shutdownStarted, _, _) =>
-        shutdownStarted.get
+      val shutdownStarted: F[Unit] = shutdownControl.map { case (deferred, _) =>
+        deferred.get
       }.getOrElse(F.never)
 
       val consumer =
         createKafkaConsumer(requests, settings, actor, polls, streamId, id, withConsumer, shutdownStarted)
 
-      (consumer, requests, shutdownStarter, logging)
+      (consumer, requests, shutdownControl, logging)
     }
 
-    Resource.make(resource.allocated) { case ((_, requests, shutdownStarter, logging), closeConsumer) =>
-      shutdownStarter match {
-        case None => closeConsumer
-        case Some((shutdownStarted, shutdownCompleted, shutdownTimeout)) =>
-          for {
-            _ <- shutdownStarted.complete(())
-            _ <- requests.enqueue1(Request.ShutdownStarted(
-              shutdownCompleted = shutdownCompleted.complete(GracefulShutdownResult.Success).attempt.void
-            ))
-            _ <- shutdownCompleted.get.timeoutTo(shutdownTimeout, {
-              val timeoutResult: GracefulShutdownResult = GracefulShutdownResult.InterruptedByTimeout(shutdownTimeout)
-              logging.log(LogEntry.GracefulShutdownInterruptedByTimeout(shutdownTimeout)) >>
-                shutdownCompleted.complete(timeoutResult).attempt.as(timeoutResult)
-            })
-            _ <- closeConsumer
-          } yield ()
+    def gracefulShutdown(
+      shutdownStarted: Deferred[F, Unit],
+      shutdownSettings: ConsumerSettings.GracefulShutdownSettings[F],
+      requests: Queue[F, Request[F, K, V]],
+      logging: Logging[F]
+    ): F[Unit] = {
+      Deferred[F, GracefulShutdownResult].flatMap { shutdownWaiter =>
+        val shutdownStartedRequest: Request[F, K, V] = Request.ShutdownStarted(
+          shutdownCompleted = shutdownWaiter.complete(GracefulShutdownResult.Success).attempt.void
+        )
+
+        val timeoutFallback: F[GracefulShutdownResult] = for {
+          _ <- logging.log(LogEntry.GracefulShutdownInterruptedByTimeout(shutdownSettings.timeout))
+          result: GracefulShutdownResult = GracefulShutdownResult.InterruptedByTimeout(shutdownSettings.timeout)
+          _ <- shutdownWaiter.complete(result).attempt.void
+        } yield result
+
+        for {
+          _ <- shutdownStarted.complete(())
+          _ <- requests.enqueue1(shutdownStartedRequest)
+          shutdownResult <- shutdownWaiter.get.timeoutTo(shutdownSettings.timeout, timeoutFallback)
+          _ <- shutdownSettings.resultHandler(shutdownResult)
+        } yield ()
       }
-    }.map { case ((consumer, _, shutdownStarter, _), _) =>
-      val shutdownResult = shutdownStarter match {
-        case Some((_, shutdownCompleted, _)) => shutdownCompleted.get
-        case None => F.never[GracefulShutdownResult]
+    }
+
+    Resource.make(resource.allocated) { case ((_, requests, shutdownControl, logging), closeConsumer) =>
+      shutdownControl match {
+        case None =>
+          closeConsumer
+        case Some((shutdownStarted, shutdownSettings)) =>
+          gracefulShutdown(shutdownStarted, shutdownSettings, requests, logging) >> closeConsumer
       }
-      (consumer, shutdownResult)
+    }.map { case ((consumer, _, _, _), _) =>
+      consumer
     }
   }
 }

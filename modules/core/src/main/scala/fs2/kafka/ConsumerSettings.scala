@@ -7,11 +7,13 @@
 package fs2.kafka
 
 import cats.effect.{Blocker, Sync}
-import cats.Show
+import cats.{Applicative, Show}
+import fs2.kafka.KafkaConsumer.GracefulShutdownResult
 import fs2.kafka.internal.converters.collection._
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.common.requests.OffsetFetchResponse
 import org.apache.kafka.common.serialization.ByteArrayDeserializer
+
 import scala.concurrent.duration._
 
 /**
@@ -397,9 +399,27 @@ sealed abstract class ConsumerSettings[F[_], K, V] {
     * instead be set to `2` and not the specified value.
     */
   def withMaxPrefetchBatches(maxPrefetchBatches: Int): ConsumerSettings[F, K, V]
+
+  def gracefulShutdownSettings: Option[ConsumerSettings.GracefulShutdownSettings[F]]
+
+  final def gracefulShutdownEnabled: Boolean = gracefulShutdownSettings.isDefined
+
+  def withGracefulShutdown(settings: ConsumerSettings.GracefulShutdownSettings[F]): ConsumerSettings[F, K, V]
+
+  def withoutGracefulShutdown: ConsumerSettings[F, K, V]
 }
 
 object ConsumerSettings {
+
+  case class GracefulShutdownSettings[F[_]](
+    timeout: FiniteDuration,
+    resultHandler: GracefulShutdownResult => F[Unit]
+  )
+  object GracefulShutdownSettings {
+    def apply[F[_]](timeout: FiniteDuration)(implicit F: Applicative[F]): GracefulShutdownSettings[F] =
+      new GracefulShutdownSettings(timeout, _ => F.unit)
+  }
+
   private[this] final case class ConsumerSettingsImpl[F[_], K, V](
     override val keyDeserializer: F[Deserializer[F, K]],
     override val valueDeserializer: F[Deserializer[F, V]],
@@ -412,6 +432,7 @@ object ConsumerSettings {
     override val commitRecovery: CommitRecovery,
     override val recordMetadata: ConsumerRecord[K, V] => String,
     override val maxPrefetchBatches: Int,
+    override val gracefulShutdownSettings: Option[GracefulShutdownSettings[F]],
     createConsumerWith: Map[String, String] => F[KafkaByteConsumer]
   ) extends ConsumerSettings[F, K, V] {
     override def withBlocker(blocker: Blocker): ConsumerSettings[F, K, V] =
@@ -535,8 +556,14 @@ object ConsumerSettings {
     override def withMaxPrefetchBatches(maxPrefetchBatches: Int): ConsumerSettings[F, K, V] =
       copy(maxPrefetchBatches = Math.max(2, maxPrefetchBatches))
 
+    override def withGracefulShutdown(settings: GracefulShutdownSettings[F]): ConsumerSettings[F, K, V] =
+      copy(gracefulShutdownSettings = Some(settings))
+
+    override def withoutGracefulShutdown: ConsumerSettings[F, K, V] =
+      copy(gracefulShutdownSettings = None)
+
     override def toString: String =
-      s"ConsumerSettings(closeTimeout = $closeTimeout, commitTimeout = $commitTimeout, pollInterval = $pollInterval, pollTimeout = $pollTimeout, commitRecovery = $commitRecovery)"
+      s"ConsumerSettings(closeTimeout = $closeTimeout, commitTimeout = $commitTimeout, pollInterval = $pollInterval, pollTimeout = $pollTimeout, commitRecovery = $commitRecovery)" // TODO
   }
 
   private[this] def create[F[_], K, V](
@@ -566,7 +593,8 @@ object ConsumerSettings {
             byteArrayDeserializer,
             byteArrayDeserializer
           )
-        }
+        },
+      gracefulShutdownSettings = None,
     )
 
   def apply[F[_], K, V](

@@ -7,6 +7,8 @@ import cats.implicits._
 import fs2.concurrent.{Queue, SignallingRef}
 import fs2.kafka.internal.converters.collection._
 import fs2.Stream
+import fs2.kafka.ConsumerSettings.GracefulShutdownSettings
+import fs2.kafka.KafkaConsumer.GracefulShutdownResult
 import net.manub.embeddedkafka.EmbeddedKafkaConfig
 import org.apache.kafka.clients.consumer.NoOffsetForPartitionException
 import org.apache.kafka.common.errors.TimeoutException
@@ -415,27 +417,30 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
         val produced = (0 until 100).map(n => s"key-$n" -> s"value->$n").toVector
         publishToKafka(topic, produced)
 
-        val cons = KafkaConsumer.consumerResourceWithGracefulShutdown(consumerSettings[IO](config), 1.second)
-          .evalTap(_._1.subscribeTo(topic))
-
         val run = for {
           consumedRef <- Ref[IO].of(Vector.empty[(String, String)])
-          result <- Ref[IO].of(Option.empty[KafkaConsumer.GracefulShutdownResult])
+          shutdownResultRef <- Ref[IO].of(Option.empty[KafkaConsumer.GracefulShutdownResult])
+          cons = KafkaConsumer.consumerResource(consumerSettings[IO](config).withGracefulShutdown(
+            GracefulShutdownSettings[IO](
+              timeout = 10.seconds,
+              resultHandler = (gracefulShutdownResult: GracefulShutdownResult) =>
+                shutdownResultRef.set(Some(gracefulShutdownResult))
+            )
+          )).evalTap(_.subscribeTo(topic))
           runStream = cons.use { consumer =>
             consumer.stream.evalMap { msg =>
-              IO(println(msg)) >>
-                consumedRef.updateAndGet(_ :+ (msg.record.key -> msg.record.value)) >> msg.offset.commit
+              consumedRef.updateAndGet(_ :+ (msg.record.key -> msg.record.value)) >> msg.offset.commit
             }.compile.drain
           }
           fiber <- runStream.start
           _ <- fiber.cancel
-          res <- result.get
+          shutdownResult <- shutdownResultRef.get
           consumed <- consumedRef.get
-        } yield consumed
+        } yield (consumed, shutdownResult)
 
-        val res = run.timeout(15.seconds).unsafeRunSync()
+        val (consumed, shutdownResult) = run.timeout(15.seconds).unsafeRunSync()
 
-        assert(res == produced)
+        assert(consumed == produced && shutdownResult.contains(GracefulShutdownResult.Success))
       }
     }
 

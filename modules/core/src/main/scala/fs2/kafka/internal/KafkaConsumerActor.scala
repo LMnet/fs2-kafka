@@ -764,7 +764,7 @@ private[kafka] object KafkaConsumerActor {
     ) extends Request[F, K, V]
 
     final case class ShutdownStarted[F[_], K, V](
-      shutdownCompleted: F[Unit]
+      shutdownCompleted: F[Unit] // TODO: тут более сложный тип нужен, чтобы иметь возможность передать ошибку?
     ) extends Request[F, K, V]
 
     final case class PartitionStreamFinalized[F[_], K, V](
