@@ -1,7 +1,7 @@
 package fs2.kafka
 
 import cats.data.NonEmptySet
-import cats.effect.concurrent.Ref
+import cats.effect.concurrent.{Deferred, Ref}
 import cats.effect.IO
 import cats.implicits._
 import fs2.concurrent.{Queue, SignallingRef}
@@ -414,7 +414,8 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
     it("should be able to do graceful shutdown") {
       withKafka { (config, topic) =>
         createCustomTopic(topic, partitions = 1)
-        val produced = (0 until 100).map(n => s"key-$n" -> s"value->$n").toVector
+        val messages = 100
+        val produced = (0 until messages).map(n => s"key-$n" -> s"value->$n").toVector
         publishToKafka(topic, produced)
 
         val run = for {
@@ -426,13 +427,16 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
               resultHandler = (gracefulShutdownResult: GracefulShutdownResult) =>
                 shutdownResultRef.set(Some(gracefulShutdownResult))
             )
-          )).evalTap(_.subscribeTo(topic))
+          ).withMaxPollRecords(messages)).evalTap(_.subscribeTo(topic))
+          receivedFirst <- Deferred[IO, Unit]
           runStream = cons.use { consumer =>
             consumer.stream.evalMap { msg =>
-              consumedRef.updateAndGet(_ :+ (msg.record.key -> msg.record.value)) >> msg.offset.commit
+              receivedFirst.complete(()).attempt >>
+                consumedRef.updateAndGet(_ :+ (msg.record.key -> msg.record.value)) >> msg.offset.commit
             }.compile.drain
           }
           fiber <- runStream.start
+          _ <- receivedFirst.get
           _ <- fiber.cancel
           shutdownResult <- shutdownResultRef.get
           consumed <- consumedRef.get
