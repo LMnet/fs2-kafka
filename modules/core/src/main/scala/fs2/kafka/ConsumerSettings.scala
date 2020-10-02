@@ -7,8 +7,7 @@
 package fs2.kafka
 
 import cats.effect.{Blocker, Sync}
-import cats.{Applicative, Show}
-import fs2.kafka.KafkaConsumer.GracefulShutdownResult
+import cats.Show
 import fs2.kafka.internal.converters.collection._
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.common.requests.OffsetFetchResponse
@@ -413,12 +412,7 @@ object ConsumerSettings {
 
   case class GracefulShutdownSettings[F[_]](
     timeout: FiniteDuration,
-    resultHandler: GracefulShutdownResult => F[Unit]
   )
-  object GracefulShutdownSettings {
-    def apply[F[_]](timeout: FiniteDuration)(implicit F: Applicative[F]): GracefulShutdownSettings[F] =
-      new GracefulShutdownSettings(timeout, _ => F.unit)
-  }
 
   private[this] final case class ConsumerSettingsImpl[F[_], K, V](
     override val keyDeserializer: F[Deserializer[F, K]],

@@ -9,7 +9,7 @@ package fs2.kafka
 import cats.{Foldable, Reducible}
 import cats.data.{NonEmptyList, NonEmptySet}
 import cats.effect._
-import cats.effect.concurrent.{Deferred, Ref}
+import cats.effect.concurrent.{Deferred, MVar, Ref}
 import cats.effect.implicits._
 import cats.implicits._
 import fs2.{Chunk, Stream}
@@ -300,6 +300,8 @@ sealed abstract class KafkaConsumer[F[_], K, V] {
     timeout: FiniteDuration
   ): F[Map[TopicPartition, Long]]
 
+  def stopConsuming: F[Unit]
+
   /**
     * A `Fiber` that can be used to cancel the underlying consumer, or
     * wait for it to complete. If you're using [[stream]], or any other
@@ -386,7 +388,7 @@ private[kafka] object KafkaConsumer {
     streamIdRef: Ref[F, StreamId],
     id: Int,
     withConsumer: WithConsumer[F],
-    shutdownStarted: F[Unit]
+    stopConsumingVar: MVar[F, Unit]
   )(implicit F: Concurrent[F]): KafkaConsumer[F, K, V] =
     new KafkaConsumer[F, K, V] {
       override val fiber: Fiber[F, Unit] = {
@@ -404,6 +406,8 @@ private[kafka] object KafkaConsumer {
 
         actorFiber combine pollsFiber
       }
+
+      override def stopConsuming: F[Unit] = stopConsumingVar.tryPut(()).void
 
       override def partitionsMapStream: Stream[F, Map[TopicPartition, Stream[F, CommittableConsumerRecord[F, K, V]]]] = {
         val chunkQueue: F[Queue[F, Option[Chunk[CommittableConsumerRecord[F, K, V]]]]] =
@@ -423,15 +427,15 @@ private[kafka] object KafkaConsumer {
           for {
             chunks <- chunkQueue
             dequeueDone <- Deferred[F, Unit]
-            shutdown = F.race(F.race(fiber.join.attempt, dequeueDone.get), shutdownStarted).void
-            stopReqs <- Deferred.tryable[F, Unit]
+            shutdown = F.race(fiber.join.attempt, dequeueDone.get).void
+            stopReqs <- MVar.empty[F, Unit]
           } yield Stream.eval {
             def fetchPartition(deferred: Deferred[F, PartitionRequest]): F[Unit] = {
               val request = Request.Fetch(partition, streamId, partitionStreamId, deferred)
               val fetch = requests.enqueue1(request) >> deferred.get
               F.race(shutdown, fetch).flatMap {
                 case Left(()) =>
-                  stopReqs.complete(())
+                  stopReqs.tryPut(()).void
 
                 case Right((chunk, reason)) =>
                   val enqueueChunk =
@@ -441,7 +445,7 @@ private[kafka] object KafkaConsumer {
 
                   val completeRevoked =
                     if (reason.topicPartitionRevoked) {
-                      stopReqs.complete(())
+                      stopReqs.tryPut(()).void
                     } else F.unit
 
                   enqueueChunk >> completeRevoked
@@ -451,19 +455,19 @@ private[kafka] object KafkaConsumer {
             F.guarantee {
               Stream
                 .repeatEval {
-                  stopReqs.tryGet.flatMap {
-                    case None =>
+                  stopReqs.isEmpty.flatMap {
+                    case true =>
                       Deferred[F, PartitionRequest] >>= fetchPartition
 
-                    case Some(()) =>
+                    case false =>
                       // Prevent issuing additional requests after partition is
                       // revoked or shutdown happens, in case the stream isn't
                       // interrupted fast enough
                       F.unit
                   }
                 }
-                .concurrently(Stream.eval(shutdownStarted >> stopReqs.complete(()).attempt))
-                .interruptWhen(F.race(shutdown, stopReqs.get).void.attempt)
+                .concurrently(Stream.eval(stopConsumingVar.read >> stopReqs.tryPut(()).void))
+                .interruptWhen(F.race(shutdown, stopReqs.read).void.attempt)
                 .compile
                 .drain
             }(F.race(dequeueDone.get, chunks.enqueue1(None)).void)
@@ -472,10 +476,7 @@ private[kafka] object KafkaConsumer {
                 chunks.dequeue.unNoneTerminate
                   .flatMap(Stream.chunk)
                   .covary[F]
-                  .onFinalize {
-                    dequeueDone.complete(()) >>
-                      requests.enqueue1(Request.PartitionStreamFinalized(partition, partitionStreamId))
-                  }
+                  .onFinalize(dequeueDone.complete(()))
               }
           }.flatten
         }
@@ -552,10 +553,8 @@ private[kafka] object KafkaConsumer {
           _ <- Stream.eval(requests.enqueue1(Request.StreamStarted(streamId)))
           _ <- Stream.eval(initialEnqueue(streamId, partitionsMapQueue, partitionStreamIdRef))
           out <- partitionsMapQueue.dequeue.interruptWhen(fiber.join.attempt).concurrently(
-            Stream.eval(shutdownStarted >> partitionsMapQueue.enqueue1(None))
-          ).onFinalizeWeak {
-            requests.enqueue1(Request.StreamFinalized(streamId))
-          }
+            Stream.eval(stopConsumingVar.read >> partitionsMapQueue.enqueue1(None))
+          )
         } yield out
       }
 
@@ -821,10 +820,47 @@ private[kafka] object KafkaConsumer {
         "KafkaConsumer$" + id
     }
 
-  sealed trait GracefulShutdownResult
-  object GracefulShutdownResult { // TODO: error когда дёрнулся fiber.cancel?
-    case object Success extends GracefulShutdownResult
-    case class InterruptedByTimeout(timeout: FiniteDuration) extends GracefulShutdownResult
+  sealed trait GracefulShutdownResult[+A]
+  object GracefulShutdownResult {
+    case class Success[A](value: A) extends GracefulShutdownResult[A]
+    case class InterruptedByTimeout(timeout: FiniteDuration) extends GracefulShutdownResult[Nothing]
+    case class Failed(throwable: Throwable) extends GracefulShutdownResult[Nothing]
+  }
+
+  def withGracefulShutdown[F[_], K, V, R](
+    settings: ConsumerSettings[F, K, V],
+    shutdownTimeout: FiniteDuration
+  )(
+    use: KafkaConsumer[F, K, V] => F[R]
+  )(
+    handleShutdownResult: GracefulShutdownResult[R] => F[Unit] // TODO: перегруженный вариант без функции
+  )(
+    implicit F: ConcurrentEffect[F],
+    context: ContextShift[F],
+    timer: Timer[F]
+  ): F[Unit] = {
+    Deferred.uncancelable[F, GracefulShutdownResult[R]].flatMap { resultDeferred =>
+      F.bracket(consumerResource[F, K, V](settings).allocated) { case (consumer, _) =>
+        F.uncancelable {
+          use(consumer).attempt.flatMap { result =>
+            resultDeferred.complete(result match {
+              case Right(r) => GracefulShutdownResult.Success(r)
+              case Left(e) => GracefulShutdownResult.Failed(e)
+            })
+          }
+        }
+      } { case (consumer, closeConsumer) =>
+        val timeoutFallback: F[GracefulShutdownResult[R]] =
+          F.pure(GracefulShutdownResult.InterruptedByTimeout(shutdownTimeout))
+
+        for {
+          _ <- consumer.stopConsuming
+          result <- resultDeferred.get.timeoutTo(shutdownTimeout, timeoutFallback)
+          _ <- handleShutdownResult(result)
+          _ <- closeConsumer
+        } yield ()
+      }
+    }
   }
 
   def consumerResource[F[_], K, V](
@@ -834,7 +870,7 @@ private[kafka] object KafkaConsumer {
     context: ContextShift[F],
     timer: Timer[F]
   ): Resource[F, KafkaConsumer[F, K, V]] = {
-    val resource = for {
+    for {
       keyDeserializer <- Resource.liftF(settings.keyDeserializer)
       valueDeserializer <- Resource.liftF(settings.valueDeserializer)
       id <- Resource.liftF(F.delay(new Object().hashCode))
@@ -855,55 +891,9 @@ private[kafka] object KafkaConsumer {
       )
       actor <- startConsumerActor(requests, polls, actor)
       polls <- startPollScheduler(polls, settings.pollInterval)
-      shutdownControl <- Resource.liftF(settings.gracefulShutdownSettings.traverse { gracefulShutdownSettings =>
-        Deferred[F, Unit].map(deferred => (deferred, gracefulShutdownSettings))
-      })
+      stopConsumingVar <- Resource.liftF(MVar.empty[F, Unit])
     } yield {
-      val shutdownStarted: F[Unit] = shutdownControl.map { case (deferred, _) =>
-        deferred.get
-      }.getOrElse(F.never)
-
-      val consumer =
-        createKafkaConsumer(requests, settings, actor, polls, streamId, id, withConsumer, shutdownStarted)
-
-      (consumer, requests, shutdownControl, logging)
-    }
-
-    def gracefulShutdown(
-      shutdownStarted: Deferred[F, Unit],
-      shutdownSettings: ConsumerSettings.GracefulShutdownSettings[F],
-      requests: Queue[F, Request[F, K, V]],
-      logging: Logging[F]
-    ): F[Unit] = {
-      Deferred[F, GracefulShutdownResult].flatMap { shutdownWaiter =>
-        val shutdownStartedRequest: Request[F, K, V] = Request.ShutdownStarted(
-          shutdownCompleted = shutdownWaiter.complete(GracefulShutdownResult.Success).attempt.void
-        )
-
-        val timeoutFallback: F[GracefulShutdownResult] = for {
-          _ <- logging.log(LogEntry.GracefulShutdownInterruptedByTimeout(shutdownSettings.timeout))
-          result: GracefulShutdownResult = GracefulShutdownResult.InterruptedByTimeout(shutdownSettings.timeout)
-          _ <- shutdownWaiter.complete(result).attempt.void
-        } yield result
-
-        for {
-          _ <- shutdownStarted.complete(())
-          _ <- requests.enqueue1(shutdownStartedRequest)
-          shutdownResult <- shutdownWaiter.get.timeoutTo(shutdownSettings.timeout, timeoutFallback)
-          _ <- shutdownSettings.resultHandler(shutdownResult)
-        } yield ()
-      }
-    }
-
-    Resource.make(resource.allocated) { case ((_, requests, shutdownControl, logging), closeConsumer) =>
-      shutdownControl match {
-        case None =>
-          closeConsumer
-        case Some((shutdownStarted, shutdownSettings)) =>
-          gracefulShutdown(shutdownStarted, shutdownSettings, requests, logging) >> closeConsumer
-      }
-    }.map { case ((consumer, _, _, _), _) =>
-      consumer
+      createKafkaConsumer(requests, settings, actor, polls, streamId, id, withConsumer, stopConsumingVar)
     }
   }
 }

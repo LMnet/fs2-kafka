@@ -1,13 +1,12 @@
 package fs2.kafka
 
 import cats.data.NonEmptySet
-import cats.effect.concurrent.{Deferred, Ref}
+import cats.effect.concurrent.{MVar, Ref}
 import cats.effect.IO
 import cats.implicits._
 import fs2.concurrent.{Queue, SignallingRef}
 import fs2.kafka.internal.converters.collection._
 import fs2.Stream
-import fs2.kafka.ConsumerSettings.GracefulShutdownSettings
 import fs2.kafka.KafkaConsumer.GracefulShutdownResult
 import net.manub.embeddedkafka.EmbeddedKafkaConfig
 import org.apache.kafka.clients.consumer.NoOffsetForPartitionException
@@ -418,33 +417,39 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
         val produced = (0 until messages).map(n => s"key-$n" -> s"value->$n").toVector
         publishToKafka(topic, produced)
 
+        val settings = consumerSettings[IO](config).withMaxPollRecords(messages)
+
         val run = for {
           consumedRef <- Ref[IO].of(Vector.empty[(String, String)])
-          shutdownResultRef <- Ref[IO].of(Option.empty[KafkaConsumer.GracefulShutdownResult])
-          cons = KafkaConsumer.consumerResource(consumerSettings[IO](config).withGracefulShutdown(
-            GracefulShutdownSettings[IO](
-              timeout = 10.seconds,
-              resultHandler = (gracefulShutdownResult: GracefulShutdownResult) =>
-                shutdownResultRef.set(Some(gracefulShutdownResult))
-            )
-          ).withMaxPollRecords(messages)).evalTap(_.subscribeTo(topic))
-          receivedFirst <- Deferred[IO, Unit]
-          runStream = cons.use { consumer =>
-            consumer.stream.evalMap { msg =>
-              receivedFirst.complete(()).attempt >>
-                consumedRef.updateAndGet(_ :+ (msg.record.key -> msg.record.value)) >> msg.offset.commit
-            }.compile.drain.uncancelable
+          shutdownResult <- MVar.empty[IO, GracefulShutdownResult[Unit]]
+          receivedFirst <- MVar.empty[IO, Unit]
+          runStream = KafkaConsumer.withGracefulShutdown(settings, 10.seconds) { consumer =>
+            for {
+              _ <- consumer.subscribeTo(topic)
+              _ <- consumer.stream.evalMap { msg =>
+                receivedFirst.tryPut(()) >>
+                  consumedRef.updateAndGet(_ :+ (msg.record.key -> msg.record.value)) >> msg.offset.commit
+              }.compile.drain
+            } yield ()
+          } { result =>
+            shutdownResult.put(result)
           }
           fiber <- runStream.start
-          _ <- receivedFirst.get
+          _ <- IO(println("1"))
+          _ <- receivedFirst.read
+          _ <- IO(println("2"))
           _ <- fiber.cancel
-          shutdownResult <- shutdownResultRef.get
+          _ <- IO(println("3"))
+          _ <- IO.race(fiber.join, shutdownResult.read).void
+          _ <- IO(println("4"))
+          _ <- shutdownResult.read
+          _ <- IO(println("5"))
           consumed <- consumedRef.get
-        } yield (consumed, shutdownResult)
+        } yield consumed
 
-        val (consumed, shutdownResult) = run.timeout(15.seconds).unsafeRunSync()
+        val consumed = run.timeout(15.seconds).unsafeRunSync()
 
-        assert(shutdownResult.contains(GracefulShutdownResult.Success) && consumed == produced)
+        assert(consumed == produced)
       }
     }
 
