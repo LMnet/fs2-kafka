@@ -904,9 +904,10 @@ private[kafka] object KafkaConsumer {
             _ <- requests.enqueue1(Request.ShutdownStarted(
               shutdownCompleted = shutdownCompleted.complete(GracefulShutdownResult.Success).attempt.void
             ))
-            _ <- shutdownCompleted.get.void.timeoutTo(shutdownTimeout, {
+            _ <- shutdownCompleted.get.timeoutTo(shutdownTimeout, {
+              val timeoutResult: GracefulShutdownResult = GracefulShutdownResult.InterruptedByTimeout(shutdownTimeout)
               logging.log(LogEntry.GracefulShutdownInterruptedByTimeout(shutdownTimeout)) >>
-                shutdownCompleted.complete(GracefulShutdownResult.InterruptedByTimeout(shutdownTimeout)).attempt.void
+                shutdownCompleted.complete(timeoutResult).attempt.as(timeoutResult)
             })
             _ <- closeConsumer
           } yield ()

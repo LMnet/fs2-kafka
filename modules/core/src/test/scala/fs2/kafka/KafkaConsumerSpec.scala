@@ -415,23 +415,21 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
         val produced = (0 until 100).map(n => s"key-$n" -> s"value->$n").toVector
         publishToKafka(topic, produced)
 
-        val cons = consumerResource[IO]
-          .using(consumerSettings[IO](config))
-          .evalTap(_.subscribeTo(topic))
+        val cons = KafkaConsumer.consumerResourceWithGracefulShutdown(consumerSettings[IO](config), 1.second)
+          .evalTap(_._1.subscribeTo(topic))
 
         val run = for {
           consumedRef <- Ref[IO].of(Vector.empty[(String, String)])
-          shuttedDownRef <- Ref[IO].of(false)
-          _ <- cons.use { consumer =>
-            consumer.stream.evalTap { _ =>
-              shuttedDownRef.getAndSet(true).flatMap { prev =>
-                if (prev == false) consumer.unsubscribe else IO.unit
-              }
-            }.evalMap { msg =>
+          result <- Ref[IO].of(Option.empty[KafkaConsumer.GracefulShutdownResult])
+          runStream = cons.use { consumer =>
+            consumer.stream.evalMap { msg =>
               IO(println(msg)) >>
-              consumedRef.updateAndGet(_ :+ (msg.record.key -> msg.record.value)) >> msg.offset.commit
+                consumedRef.updateAndGet(_ :+ (msg.record.key -> msg.record.value)) >> msg.offset.commit
             }.compile.drain
           }
+          fiber <- runStream.start
+          _ <- fiber.cancel
+          res <- result.get
           consumed <- consumedRef.get
         } yield consumed
 
