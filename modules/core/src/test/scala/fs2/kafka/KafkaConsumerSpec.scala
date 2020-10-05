@@ -196,6 +196,7 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
       }
     }
 
+    // TODO: move test
     it("should get metrics") {
       withKafka { (config, topic) =>
         val partitions = List(0, 1, 2)
@@ -264,8 +265,7 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
       }
     }
 
-    it("should handle rebalance") {
-      withKafka { (config, topic) =>
+    it("should handle rebalance") {      withKafka { (config, topic) =>
         createCustomTopic(topic, partitions = 3)
         val produced1 = (0 until 100).map(n => s"key-$n" -> s"value->$n")
         val produced2 = (100 until 200).map(n => s"key-$n" -> s"value->$n")
@@ -311,6 +311,7 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
       }
     }
 
+    // TODO: move test
     it("should close all streams on rebalance when using partitionedStream") {
 
       withKafka { (config, topic) =>
@@ -357,6 +358,7 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
       }
     }
 
+    // TODO: move test
     it("should close all streams on rebalance when using partitionedStream several times") {
 
       withKafka { (config, topic) =>
@@ -410,6 +412,7 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
       }
     }
 
+    // TODO: move test
     it("should be able to do graceful shutdown") {
       withKafka { (config, topic) =>
         createCustomTopic(topic, partitions = 1)
@@ -435,15 +438,10 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
             shutdownResult.put(result)
           }
           fiber <- runStream.start
-          _ <- IO(println("1"))
           _ <- receivedFirst.read
-          _ <- IO(println("2"))
           _ <- fiber.cancel
-          _ <- IO(println("3"))
           _ <- IO.race(fiber.join, shutdownResult.read).void
-          _ <- IO(println("4"))
           _ <- shutdownResult.read
-          _ <- IO(println("5"))
           consumed <- consumedRef.get
         } yield consumed
 
@@ -518,7 +516,8 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
       }
     }
 
-    it("should interrupt the stream when cancelled") { // TODO: add test with graceful shutdown
+    // TODO: add test with graceful shutdown
+    it("should interrupt the stream when cancelled") {
       withKafka { (config, topic) =>
         val consumed =
           consumerStream[IO]
@@ -773,6 +772,12 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
 
       consumed should contain theSameElementsAs produced.drop(readOffset.toInt)
     }
+  }
+
+  describe("KafkaConsumer#stopConsuming") {
+    it("should gracefully stop running stream") {}
+    it("should gracefully stop running streams when there is more than one stream") {}
+    it("should not start new streams after 'stopConsuming' call") {}
   }
 
   describe("KafkaConsumer#assignmentStream") {
