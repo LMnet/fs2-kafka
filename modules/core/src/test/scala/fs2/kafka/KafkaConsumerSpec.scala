@@ -9,7 +9,7 @@ import fs2.concurrent.{Queue, SignallingRef}
 import fs2.kafka.KafkaConsumer.GracefulShutdownResult
 import fs2.kafka.internal.converters.collection._
 import net.manub.embeddedkafka.EmbeddedKafkaConfig
-import org.apache.kafka.clients.consumer.NoOffsetForPartitionException
+import org.apache.kafka.clients.consumer.{NoOffsetForPartitionException, OffsetAndMetadata}
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.errors.TimeoutException
 
@@ -855,7 +855,7 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
   }
 
   describe("KafkaConsumer#commit") {
-    it("should commit supplied offsets of messages from the topic to which consumer assigned") {
+    it("should commit offsets of messages from the topic to which consumer assigned") {
       withKafka { (config, topic) =>
         createCustomTopic(topic, partitions = 3)
         val produced = (0 until 10).map(n => s"key-$n" -> s"value->$n")
@@ -886,10 +886,32 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
         assert {
           committed.values.toList.foldMap(_.offset) == produced.size.toLong && committed == actuallyCommitted
         }
-
       }
     }
 
-    it("should not commit supplied offsets when offsets are from a topic that the consumer is not assigned to") {}
+    it("should not commit offsets when offsets are from a topic that the consumer is not assigned to") {
+      withKafka { (config, topic) =>
+        createCustomTopic(topic, partitions = 1)
+        val produced = (0 until 10).map(n => s"key-$n" -> s"value->$n")
+        publishToKafka(topic, produced)
+
+        val createConsumer = consumerStream[IO]
+          .using(consumerSettings[IO](config))
+
+        val partition = new TopicPartition(topic, 0)
+        val offset = new OffsetAndMetadata(5)
+
+        (for {
+          consumer <- createConsumer
+          _ <- Stream.eval(consumer.commit(Map((partition, offset))))
+        } yield ()).compile.lastOrError.unsafeRunSync()
+
+        val actuallyCommitted = withKafkaConsumer(consumerProperties(config)) { consumer =>
+          consumer.committed(Set(partition).asJava).asScala.toMap
+        }
+
+        assert(actuallyCommitted.get(partition).exists(_.offset() == offset.offset()))
+      }
+    }
   }
 }

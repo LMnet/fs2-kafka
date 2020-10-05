@@ -21,6 +21,7 @@ import fs2.kafka.internal.syntax._
 import java.time.Duration
 import java.util
 import java.util.regex.Pattern
+
 import org.apache.kafka.clients.consumer.{ConsumerConfig, ConsumerRebalanceListener, OffsetAndMetadata, OffsetCommitCallback}
 import org.apache.kafka.common.TopicPartition
 
