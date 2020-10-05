@@ -21,6 +21,7 @@ import fs2.kafka.internal.KafkaConsumerActor._
 import fs2.kafka.internal.syntax._
 import java.util
 
+import org.apache.kafka.clients.consumer.OffsetAndMetadata
 import org.apache.kafka.common.{Metric, MetricName, PartitionInfo, TopicPartition}
 
 import scala.collection.immutable.SortedSet
@@ -94,6 +95,9 @@ sealed abstract class KafkaConsumer[F[_], K, V] {
 
   // TODO: doc
   def partitionsMapStream: Stream[F, Map[TopicPartition, Stream[F, CommittableConsumerRecord[F, K, V]]]]
+
+  // TODO: doc
+  def commit(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit]
 
   /**
     * Returns the set of partitions currently assigned to this consumer.
@@ -578,6 +582,16 @@ private[kafka] object KafkaConsumer {
               case Right(a) => F.pure(a)
             }
         }
+
+      // TODO: переиспользовать уже существующий commit
+      override def commit(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit] = {
+        withConsumer { consumer =>
+          F.delay {
+            // TODO: commitAsync hangs for some reason
+            consumer.commitSync(offsets.asJava)
+          }
+        }
+      }
 
       override def assignment: F[SortedSet[TopicPartition]] =
         assignment(Option.empty)

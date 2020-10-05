@@ -154,6 +154,7 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
       }
     }
 
+    // TODO: move test
     it("should correctly get partitions from topic via partitionsFor") {
       withKafka { (config, topic) =>
         val partitions = List(0, 1, 2)
@@ -174,6 +175,7 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
       }
     }
 
+    // TODO: move test and improve naming
     it("should fail when to get partitions from topic via partitionsFor with a small timeout") {
       withKafka { (config, topic) =>
         val partitions = List(0, 1, 2)
@@ -853,5 +855,11 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
         } yield ()).compile.drain.unsafeRunSync()
       }
     }
+  }
+
+  describe("KafkaConsumer#commit") {
+    it("should commit supplied offsets of messages from the topic to which consumer subscribed") {}
+
+    it("should not commit supplied offsets when offsets are from a topic that the consumer is not subscribed to") {}
   }
 }
