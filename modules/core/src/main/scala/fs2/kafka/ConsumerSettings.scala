@@ -398,21 +398,9 @@ sealed abstract class ConsumerSettings[F[_], K, V] {
     * instead be set to `2` and not the specified value.
     */
   def withMaxPrefetchBatches(maxPrefetchBatches: Int): ConsumerSettings[F, K, V]
-
-  def gracefulShutdownSettings: Option[ConsumerSettings.GracefulShutdownSettings[F]]
-
-  final def gracefulShutdownEnabled: Boolean = gracefulShutdownSettings.isDefined
-
-  def withGracefulShutdown(settings: ConsumerSettings.GracefulShutdownSettings[F]): ConsumerSettings[F, K, V]
-
-  def withoutGracefulShutdown: ConsumerSettings[F, K, V]
 }
 
 object ConsumerSettings {
-
-  case class GracefulShutdownSettings[F[_]](
-    timeout: FiniteDuration,
-  )
 
   private[this] final case class ConsumerSettingsImpl[F[_], K, V](
     override val keyDeserializer: F[Deserializer[F, K]],
@@ -426,7 +414,6 @@ object ConsumerSettings {
     override val commitRecovery: CommitRecovery,
     override val recordMetadata: ConsumerRecord[K, V] => String,
     override val maxPrefetchBatches: Int,
-    override val gracefulShutdownSettings: Option[GracefulShutdownSettings[F]],
     createConsumerWith: Map[String, String] => F[KafkaByteConsumer]
   ) extends ConsumerSettings[F, K, V] {
     override def withBlocker(blocker: Blocker): ConsumerSettings[F, K, V] =
@@ -550,14 +537,8 @@ object ConsumerSettings {
     override def withMaxPrefetchBatches(maxPrefetchBatches: Int): ConsumerSettings[F, K, V] =
       copy(maxPrefetchBatches = Math.max(2, maxPrefetchBatches))
 
-    override def withGracefulShutdown(settings: GracefulShutdownSettings[F]): ConsumerSettings[F, K, V] =
-      copy(gracefulShutdownSettings = Some(settings))
-
-    override def withoutGracefulShutdown: ConsumerSettings[F, K, V] =
-      copy(gracefulShutdownSettings = None)
-
     override def toString: String =
-      s"ConsumerSettings(closeTimeout = $closeTimeout, commitTimeout = $commitTimeout, pollInterval = $pollInterval, pollTimeout = $pollTimeout, commitRecovery = $commitRecovery)" // TODO
+      s"ConsumerSettings(closeTimeout = $closeTimeout, commitTimeout = $commitTimeout, pollInterval = $pollInterval, pollTimeout = $pollTimeout, commitRecovery = $commitRecovery)"
   }
 
   private[this] def create[F[_], K, V](
@@ -587,8 +568,7 @@ object ConsumerSettings {
             byteArrayDeserializer,
             byteArrayDeserializer
           )
-        },
-      gracefulShutdownSettings = None,
+        }
     )
 
   def apply[F[_], K, V](
