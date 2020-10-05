@@ -550,7 +550,6 @@ private[kafka] object KafkaConsumer {
           partitionsMapQueue <- Stream.eval(Queue.noneTerminated[F, PartitionsMap])
           streamId <- Stream.eval(streamIdRef.modify(n => (n + 1, n)))
           partitionStreamIdRef <- Stream.eval(Ref.of[F, PartitionStreamId](0))
-          _ <- Stream.eval(requests.enqueue1(Request.StreamStarted(streamId)))
           _ <- Stream.eval(initialEnqueue(streamId, partitionsMapQueue, partitionStreamIdRef))
           out <- partitionsMapQueue.dequeue.interruptWhen(fiber.join.attempt).concurrently(
             Stream.eval(stopConsumingVar.read >> partitionsMapQueue.enqueue1(None))
