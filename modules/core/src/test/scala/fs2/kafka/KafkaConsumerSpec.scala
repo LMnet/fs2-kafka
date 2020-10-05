@@ -1,17 +1,17 @@
 package fs2.kafka
 
 import cats.data.NonEmptySet
-import cats.effect.concurrent.{MVar, Ref}
 import cats.effect.IO
+import cats.effect.concurrent.{MVar, Ref}
 import cats.implicits._
-import fs2.concurrent.{Queue, SignallingRef}
-import fs2.kafka.internal.converters.collection._
 import fs2.Stream
+import fs2.concurrent.{Queue, SignallingRef}
 import fs2.kafka.KafkaConsumer.GracefulShutdownResult
+import fs2.kafka.internal.converters.collection._
 import net.manub.embeddedkafka.EmbeddedKafkaConfig
-import org.apache.kafka.clients.consumer.{NoOffsetForPartitionException, OffsetAndMetadata}
-import org.apache.kafka.common.errors.TimeoutException
+import org.apache.kafka.clients.consumer.NoOffsetForPartitionException
 import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.errors.TimeoutException
 
 import scala.collection.immutable.SortedSet
 import scala.concurrent.duration._
@@ -501,8 +501,6 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
         assert {
           committed.values.toList.foldMap(_.offset) == produced.size.toLong &&
           withKafkaConsumer(consumerProperties(config)) { consumer =>
-            committed.values.toList.foldMap(_.offset)
-
             committed.foldLeft(true) {
               case (result, (topicPartition, offsetAndMetadata)) =>
                 result &&
@@ -857,44 +855,41 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
   }
 
   describe("KafkaConsumer#commit") {
-    it("should commit supplied offsets of messages from the topic to which consumer subscribed") {
+    it("should commit supplied offsets of messages from the topic to which consumer assigned") {
       withKafka { (config, topic) =>
         createCustomTopic(topic, partitions = 3)
-        val produced = (0 until 5).map(n => s"key-$n" -> s"value->$n")
+        val produced = (0 until 10).map(n => s"key-$n" -> s"value->$n")
         publishToKafka(topic, produced)
 
         val partitions = NonEmptySet.fromSetUnsafe(SortedSet(0, 1, 2))
 
         val createConsumer = consumerStream[IO]
-          .using(consumerSettings[IO](config).withGroupId("test"))
+          .using(consumerSettings[IO](config))
           .evalTap(_.assign(topic, partitions))
 
-        Stream.eval(Ref[IO].of(0)).flatMap { consumedCntRef =>
-          createConsumer.flatMap { consumer =>
-            consumer.stream.evalMap { _ =>
-              consumedCntRef.updateAndGet(_ + 1)
-            }.takeWhile(_ < produced.size)
-          }
+        val committed = (for {
+          consumer <- createConsumer
+          consumed <- consumer
+            .stream
+            .take(produced.size.toLong)
+            .map(_.offset)
+            .fold(CommittableOffsetBatch.empty[IO])(_ updated _)
+          _ <- Stream.eval(consumer.commit(consumed.offsets))
+        } yield consumed.offsets).compile.lastOrError.unsafeRunSync()
+
+        val actuallyCommitted = withKafkaConsumer(consumerProperties(config)) { consumer =>
+          consumer.committed(partitions.toSortedSet.toSet.map { partition =>
+            new TopicPartition(topic, partition)
+          }.asJava).asScala.toMap
         }
 
-        val run = for {
-          consumedRef <- Stream.eval(Ref[IO].of(List.empty[CommittableOffset[IO]]))
-          consumer <- createConsumer
-          consumed <- consumer.stream.evalMap { msg =>
-            consumedRef.updateAndGet(_ :+ msg.offset)
-          }.takeWhile(_.size < produced.size).foldMonoid
-          offsetsToCommit: Map[TopicPartition, OffsetAndMetadata] = consumed.map { offset =>
-            offset.topicPartition -> offset.offsetAndMetadata
-          }.groupMap(_._1)(_._2).map { case (partition, offsets) =>
-            partition -> offsets.maxBy(_.offset())
-          }
-          _ <- Stream.eval(consumer.commit(offsetsToCommit))
-        } yield ()
+        assert {
+          committed.values.toList.foldMap(_.offset) == produced.size.toLong && committed == actuallyCommitted
+        }
 
-        run.compile.drain.unsafeRunSync()
       }
     }
 
-    it("should not commit supplied offsets when offsets are from a topic that the consumer is not subscribed to") {}
+    it("should not commit supplied offsets when offsets are from a topic that the consumer is not assigned to") {}
   }
 }
