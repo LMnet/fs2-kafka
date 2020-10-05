@@ -583,13 +583,12 @@ private[kafka] object KafkaConsumer {
             }
         }
 
-      // TODO: переиспользовать уже существующий commit
       override def commit(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit] = {
-        withConsumer { consumer =>
-          F.delay {
-            // TODO: commitAsync hangs for some reason
-            consumer.commitSync(offsets.asJava)
-          }
+        request { deferred =>
+          Request.Commit(
+            deferred = deferred,
+            offsets = offsets
+          )
         }
       }
 

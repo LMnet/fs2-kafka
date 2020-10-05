@@ -212,7 +212,7 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
               ): Unit = {
                 val result = Option(exception).toLeft(())
                 val complete = request.deferred.complete(result)
-                F.runAsync(complete)(_ => IO.unit).unsafeRunSync()
+                F.runAsync(complete)(_ => IO.unit).unsafeRunSync() // TODO
               }
             }
           )

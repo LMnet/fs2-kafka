@@ -9,7 +9,7 @@ import fs2.kafka.internal.converters.collection._
 import fs2.Stream
 import fs2.kafka.KafkaConsumer.GracefulShutdownResult
 import net.manub.embeddedkafka.EmbeddedKafkaConfig
-import org.apache.kafka.clients.consumer.NoOffsetForPartitionException
+import org.apache.kafka.clients.consumer.{NoOffsetForPartitionException, OffsetAndMetadata}
 import org.apache.kafka.common.errors.TimeoutException
 import org.apache.kafka.common.TopicPartition
 
@@ -858,7 +858,43 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
   }
 
   describe("KafkaConsumer#commit") {
-    it("should commit supplied offsets of messages from the topic to which consumer subscribed") {}
+    it("should commit supplied offsets of messages from the topic to which consumer subscribed") {
+      withKafka { (config, topic) =>
+        createCustomTopic(topic, partitions = 3)
+        val produced = (0 until 5).map(n => s"key-$n" -> s"value->$n")
+        publishToKafka(topic, produced)
+
+        val partitions = NonEmptySet.fromSetUnsafe(SortedSet(0, 1, 2))
+
+        val createConsumer = consumerStream[IO]
+          .using(consumerSettings[IO](config).withGroupId("test"))
+          .evalTap(_.assign(topic, partitions))
+
+        Stream.eval(Ref[IO].of(0)).flatMap { consumedCntRef =>
+          createConsumer.flatMap { consumer =>
+            consumer.stream.evalMap { _ =>
+              consumedCntRef.updateAndGet(_ + 1)
+            }.takeWhile(_ < produced.size)
+          }
+        }
+
+        val run = for {
+          consumedRef <- Stream.eval(Ref[IO].of(List.empty[CommittableOffset[IO]]))
+          consumer <- createConsumer
+          consumed <- consumer.stream.evalMap { msg =>
+            consumedRef.updateAndGet(_ :+ msg.offset)
+          }.takeWhile(_.size < produced.size).foldMonoid
+          offsetsToCommit: Map[TopicPartition, OffsetAndMetadata] = consumed.map { offset =>
+            offset.topicPartition -> offset.offsetAndMetadata
+          }.groupMap(_._1)(_._2).map { case (partition, offsets) =>
+            partition -> offsets.maxBy(_.offset())
+          }
+          _ <- Stream.eval(consumer.commit(offsetsToCommit))
+        } yield ()
+
+        run.compile.drain.unsafeRunSync()
+      }
+    }
 
     it("should not commit supplied offsets when offsets are from a topic that the consumer is not subscribed to") {}
   }
