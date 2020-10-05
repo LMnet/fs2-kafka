@@ -19,7 +19,6 @@ import java.util.regex.Pattern
 import org.apache.kafka.common.TopicPartition
 
 import scala.collection.immutable.SortedSet
-import scala.concurrent.duration.FiniteDuration
 
 private[kafka] sealed abstract class LogEntry {
   def level: LogLevel
@@ -170,14 +169,6 @@ private[kafka] object LogEntry {
     override def level: LogLevel = Debug
     override def message: String =
       s"Committed pending commits [$pendingCommits]. Current state [$state]."
-  }
-
-  final case class GracefulShutdownInterruptedByTimeout(
-    timeout: FiniteDuration
-  ) extends LogEntry {
-    override def level: LogLevel = Warn
-    override def message: String =
-      s"Graceful shutdown of a consumer was interrupted by timeout after $timeout. Consumer will be closed forcefully."
   }
 
   def recordsString[F[_], K, V](
