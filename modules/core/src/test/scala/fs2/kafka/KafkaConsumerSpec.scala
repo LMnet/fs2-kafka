@@ -267,7 +267,8 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
       }
     }
 
-    it("should handle rebalance") {      withKafka { (config, topic) =>
+    it("should handle rebalance") {
+      withKafka { (config, topic) =>
         createCustomTopic(topic, partitions = 3)
         val produced1 = (0 until 100).map(n => s"key-$n" -> s"value->$n")
         val produced2 = (100 until 200).map(n => s"key-$n" -> s"value->$n")
@@ -315,7 +316,6 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
 
     // TODO: move test
     it("should close all streams on rebalance when using partitionedStream") {
-
       withKafka { (config, topic) =>
         val numPartitions = 3
         createCustomTopic(topic, partitions = numPartitions)
@@ -362,7 +362,6 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
 
     // TODO: move test
     it("should close all streams on rebalance when using partitionedStream several times") {
-
       withKafka { (config, topic) =>
         val numPartitions = 3
         createCustomTopic(topic, partitions = numPartitions)
