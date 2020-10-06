@@ -201,6 +201,11 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
   }
 
   private[this] def commitAsync(request: Request.Commit[F, K, V]): F[Unit] = {
+    // A curious reader may ask — why this place is not implemented using `F.async` or `F.asyncF`?
+    // That's because `F.async` will wait for the callback call and will not release `F` from the whole `commitAsync`
+    // method. But in the java client, a callback for the `commitAsync` could be resolved only with the `poll` calls.
+    // So, to make it work we need to release `commitAsync` right after the call and call `poll` after that.
+    // This is not how `F.async` works.
     val commit =
       withConsumer { consumer =>
         F.delay {
@@ -213,7 +218,7 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
               ): Unit = {
                 val result = Option(exception).toLeft(())
                 val complete = request.deferred.complete(result)
-                F.runAsync(complete)(_ => IO.unit).unsafeRunSync() // TODO
+                F.runAsync(complete)(_ => IO.unit).unsafeRunSync()
               }
             }
           )
@@ -226,14 +231,27 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
     }
   }
 
-  private[this] def commit(request: Request.Commit[F, K, V]): F[Unit] =
-    ref.get.flatMap { state => // TODO: неправильное использование ref
+  private[this] def commit(request: Request.Commit[F, K, V]): F[Unit] = {
+    ref.modify { state =>
       if (state.rebalancing) {
-        ref
-          .updateAndGet(_.withPendingCommit(request))
-          .log(StoredPendingCommit(request, _))
-      } else commitAsync(request)
+        val newState = state.withPendingCommit(request)
+        (newState, Some(newState))
+      } else {
+        (state, None)
+      }
+    }.flatMap {
+      case Some(newState) => logging.log(StoredPendingCommit(request, newState))
+      case None => commitAsync(request)
     }
+  }
+
+  private[this] def commitSync(request: Request.CommitSync[F, K, V]): F[Unit] = {
+    val commit = withConsumer { consumer =>
+      F.delay(consumer.commitSync(request.offsets.asJava))
+    }
+
+    commit.attempt >>= request.deferred.complete
+  }
 
   private[this] def assigned(assigned: SortedSet[TopicPartition]): F[Unit] =
     ref
@@ -484,6 +502,7 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
       case Request.Fetch(partition, streamId, partitionStreamId, deferred) =>
         fetch(partition, streamId, partitionStreamId, deferred)
       case request @ Request.Commit(_, _) => commit(request)
+      case request @ Request.CommitSync(_, _) => commitSync(request)
     }
 }
 
@@ -703,6 +722,11 @@ private[kafka] object KafkaConsumerActor {
     ) extends Request[F, K, V]
 
     final case class Commit[F[_], K, V](
+      offsets: Map[TopicPartition, OffsetAndMetadata],
+      deferred: Deferred[F, Either[Throwable, Unit]]
+    ) extends Request[F, K, V]
+
+    final case class CommitSync[F[_], K, V](
       offsets: Map[TopicPartition, OffsetAndMetadata],
       deferred: Deferred[F, Either[Throwable, Unit]]
     ) extends Request[F, K, V]
