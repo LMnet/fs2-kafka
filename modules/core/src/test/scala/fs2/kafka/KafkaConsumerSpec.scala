@@ -12,6 +12,7 @@ import net.manub.embeddedkafka.EmbeddedKafkaConfig
 import org.apache.kafka.clients.consumer.{NoOffsetForPartitionException, OffsetAndMetadata}
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.errors.TimeoutException
+import org.scalatest.Assertion
 
 import scala.collection.immutable.SortedSet
 import scala.concurrent.duration._
@@ -478,40 +479,8 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
     }
 
     it("should commit the last processed offsets") {
-      withKafka { (config, topic) =>
-        createCustomTopic(topic, partitions = 3)
-        val produced = (0 until 100).map(n => s"key-$n" -> s"value->$n")
-        publishToKafka(topic, produced)
-
-        val committed =
-          Stream(consumerSettings[IO](config))
-            .flatMap(consumerStream[IO].using)
-            .evalTap(_.subscribe(topic.r))
-            .flatMap { consumer =>
-              consumer.stream
-                .take(produced.size.toLong)
-                .map(_.offset)
-                .fold(CommittableOffsetBatch.empty[IO])(_ updated _)
-                .evalMap(batch => batch.commit.as(batch.offsets))
-            }
-            .compile
-            .lastOrError
-            .unsafeRunSync()
-
-        assert {
-          committed.values.toList.foldMap(_.offset) == produced.size.toLong &&
-          withKafkaConsumer(consumerProperties(config)) { consumer =>
-            committed.foldLeft(true) {
-              case (result, (topicPartition, offsetAndMetadata)) =>
-                result &&
-                  consumer
-                    .committed(Set(topicPartition).asJava)
-                    .asScala
-                    .get(topicPartition)
-                    .contains(offsetAndMetadata)
-            }
-          }
-        }
+      commitTest { case (_, offsetBatch) =>
+        offsetBatch.commit
       }
     }
 
@@ -854,63 +823,55 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
     }
   }
 
-  describe("KafkaConsumer#commit") {
+  describe("KafkaConsumer#commitAsync") {
     it("should commit offsets of messages from the topic to which consumer assigned") {
-      withKafka { (config, topic) =>
-        createCustomTopic(topic, partitions = 3)
-        val produced = (0 until 10).map(n => s"key-$n" -> s"value->$n")
-        publishToKafka(topic, produced)
-
-        val partitions = NonEmptySet.fromSetUnsafe(SortedSet(0, 1, 2))
-
-        val createConsumer = consumerStream[IO]
-          .using(consumerSettings[IO](config))
-          .evalTap(_.assign(topic, partitions))
-
-        val committed = (for {
-          consumer <- createConsumer
-          consumed <- consumer
-            .stream
-            .take(produced.size.toLong)
-            .map(_.offset)
-            .fold(CommittableOffsetBatch.empty[IO])(_ updated _)
-          _ <- Stream.eval(consumer.commit(consumed.offsets))
-        } yield consumed.offsets).compile.lastOrError.unsafeRunSync()
-
-        val actuallyCommitted = withKafkaConsumer(consumerProperties(config)) { consumer =>
-          consumer.committed(partitions.toSortedSet.toSet.map { partition =>
-            new TopicPartition(topic, partition)
-          }.asJava).asScala.toMap
-        }
-
-        assert {
-          committed.values.toList.foldMap(_.offset) == produced.size.toLong && committed == actuallyCommitted
-        }
+      commitTest { case (consumer, offsetBatch) =>
+        consumer.commitAsync(offsetBatch.offsets)
       }
     }
+  }
 
-    it("should not commit offsets when offsets are from a topic that the consumer is not assigned to") {
-      withKafka { (config, topic) =>
-        createCustomTopic(topic, partitions = 1)
-        val produced = (0 until 10).map(n => s"key-$n" -> s"value->$n")
-        publishToKafka(topic, produced)
+  describe("KafkaConsumer#commitSync") {
+    it("should commit offsets of messages from the topic to which consumer assigned") {
+      commitTest { case (consumer, offsetBatch) =>
+        consumer.commitSync(offsetBatch.offsets)
+      }
+    }
+  }
 
-        val createConsumer = consumerStream[IO]
-          .using(consumerSettings[IO](config))
+  private def commitTest(
+    commit: (KafkaConsumer[IO, String, String], CommittableOffsetBatch[IO]) => IO[Unit]
+  ): Assertion = {
+    withKafka { (config, topic) =>
+      val partitionsAmount = 3
+      createCustomTopic(topic, partitions = partitionsAmount)
+      val produced = (0 until 100).map(n => s"key-$n" -> s"value->$n")
+      publishToKafka(topic, produced)
 
-        val partition = new TopicPartition(topic, 0)
-        val offset = new OffsetAndMetadata(5)
+      val partitions = NonEmptySet.fromSetUnsafe(SortedSet.from(0 until partitionsAmount))
 
-        (for {
-          consumer <- createConsumer
-          _ <- Stream.eval(consumer.commit(Map((partition, offset))))
-        } yield ()).compile.lastOrError.unsafeRunSync()
+      val createConsumer = consumerStream[IO]
+        .using(consumerSettings[IO](config))
+        .evalTap(_.subscribeTo(topic))
 
-        val actuallyCommitted = withKafkaConsumer(consumerProperties(config)) { consumer =>
-          consumer.committed(Set(partition).asJava).asScala.toMap
-        }
+      val committed = (for {
+        consumer <- createConsumer
+        consumed <- consumer
+          .stream
+          .take(produced.size.toLong)
+          .map(_.offset)
+          .fold(CommittableOffsetBatch.empty[IO])(_ updated _)
+        _ <- Stream.eval(commit(consumer, consumed))
+      } yield consumed.offsets).compile.lastOrError.unsafeRunSync()
 
-        assert(actuallyCommitted.get(partition).exists(_.offset() == offset.offset()))
+      val actuallyCommitted = withKafkaConsumer(consumerProperties(config)) { consumer =>
+        consumer.committed(partitions.toSortedSet.toSet.map { partition =>
+          new TopicPartition(topic, partition)
+        }.asJava).asScala.toMap
+      }
+
+      assert {
+        committed.values.toList.foldMap(_.offset) == produced.size.toLong && committed == actuallyCommitted
       }
     }
   }

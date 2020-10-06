@@ -97,7 +97,10 @@ sealed abstract class KafkaConsumer[F[_], K, V] {
   def partitionsMapStream: Stream[F, Map[TopicPartition, Stream[F, CommittableConsumerRecord[F, K, V]]]]
 
   // TODO: doc
-  def commit(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit]
+  def commitAsync(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit]
+
+  // TODO: doc
+  def commitSync(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit]
 
   /**
     * Returns the set of partitions currently assigned to this consumer.
@@ -583,9 +586,18 @@ private[kafka] object KafkaConsumer {
             }
         }
 
-      override def commit(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit] = {
+      override def commitAsync(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit] = {
         request { deferred =>
           Request.Commit(
+            deferred = deferred,
+            offsets = offsets
+          )
+        }
+      }
+
+      override def commitSync(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit] = {
+        request { deferred =>
+          Request.CommitSync(
             deferred = deferred,
             offsets = offsets
           )
