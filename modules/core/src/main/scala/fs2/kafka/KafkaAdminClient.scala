@@ -186,6 +186,12 @@ sealed abstract class KafkaAdminClient[F[_]] {
     * }}}
     */
   def listTopics: ListTopics[F]
+
+  // TODO: doc
+  def alterConsumerGroupOffsets(groupId: String, offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit]
+
+  // TODO: doc
+  def deleteConsumerGroupOffsets(groupId: String, partitions: Set[TopicPartition]): F[Unit]
 }
 
 object KafkaAdminClient {
@@ -445,6 +451,20 @@ object KafkaAdminClient {
         "ListTopics$" + System.identityHashCode(this)
     }
 
+  private[this] def alterConsumerGroupOffsetsWith[F[_]](
+    withAdminClient: WithAdminClient[F],
+    groupId: String,
+    offsets: Map[TopicPartition, OffsetAndMetadata]
+  ): F[Unit] =
+    withAdminClient(_.alterConsumerGroupOffsets(groupId, offsets.asJava).all().void)
+
+  private[this] def deleteConsumerGroupOffsetsWith[F[_]](
+    withAdminClient: WithAdminClient[F],
+    groupId: String,
+    partitions: Set[TopicPartition]
+  ): F[Unit] =
+    withAdminClient(_.deleteConsumerGroupOffsets(groupId, partitions.asJava).all().void)
+
   private[kafka] def resource[F[_]](
     settings: AdminClientSettings[F]
   )(
@@ -516,8 +536,21 @@ object KafkaAdminClient {
         override def describeAcls(filter: AclBindingFilter): F[List[AclBinding]] =
           describeAclsWith(client, filter)
 
+        override def alterConsumerGroupOffsets(
+          groupId: String,
+          offsets: Map[TopicPartition, OffsetAndMetadata]
+        ): F[Unit] =
+          alterConsumerGroupOffsetsWith(client, groupId, offsets)
+
+        override def deleteConsumerGroupOffsets(
+          groupId: String,
+          partitions: Set[TopicPartition]
+        ): F[Unit] =
+          deleteConsumerGroupOffsetsWith(client, groupId, partitions)
+
         override def toString: String =
           "KafkaAdminClient$" + System.identityHashCode(this)
+
       }
     }
 }
