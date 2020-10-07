@@ -8,7 +8,7 @@ val embeddedKafkaVersion = "2.6.0"
 
 val fs2Version = "2.4.4"
 
-val kafkaVersion = "2.5.0"
+val kafkaVersion = "2.6.0"
 
 val vulcanVersion = "1.2.0"
 
@@ -184,7 +184,15 @@ lazy val publishSettings =
         email = "github@vlovgr.se",
         url = url("https://vlovgr.se")
       )
-    )
+    ),
+    publishTo := {
+      val artifactory = s"https://artifactory.web-staging.2gis.ru/artifactory/"
+      if (version.value.trim.endsWith("SNAPSHOT"))
+        Some("snapshots" at artifactory + "libs-snapshot-local")
+      else
+        Some("releases" at artifactory + "libs-release-local")
+    },
+    version := "1.0.0-2gis-3-SNAPSHOT"
   )
 
 lazy val mimaSettings = Seq(
@@ -222,7 +230,6 @@ lazy val scalaSettings = Seq(
     "-language:higherKinds",
     "-language:implicitConversions",
     "-unchecked",
-    "-Xfatal-warnings",
     "-Xlint",
     "-Yno-adapted-args",
     "-Ywarn-dead-code",
