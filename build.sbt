@@ -192,7 +192,7 @@ lazy val publishSettings =
       else
         Some("releases" at artifactory + "libs-release-local")
     },
-    version := "1.0.0-2gis-3-SNAPSHOT"
+    version := "1.0.0-2gis-4"
   )
 
 lazy val mimaSettings = Seq(
