@@ -54,4 +54,6 @@ trait KafkaCommit[F[_]] {
     * @see org.apache.kafka.clients.consumer.KafkaConsumer#commitSync
     */
   def commitSync(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit]
+
+  private[kafka] def commitInternal(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit]
 }

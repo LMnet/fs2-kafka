@@ -48,6 +48,7 @@ import scala.collection.immutable.SortedSet
   * is more demand.
   */
 private[kafka] final class KafkaConsumerActor[F[_], K, V](
+  owner: KafkaConsumer[F, K, V],
   settings: ConsumerSettings[F, K, V],
   keyDeserializer: Deserializer[F, K],
   valueDeserializer: Deserializer[F, V],
@@ -395,7 +396,7 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
           record.offset + 1L,
           settings.recordMetadata(record)
         ),
-        commit = offsetCommit
+        committer = owner
       )
     )
 

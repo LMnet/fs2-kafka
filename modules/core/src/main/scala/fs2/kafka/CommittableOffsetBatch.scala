@@ -6,11 +6,11 @@
 
 package fs2.kafka
 
-import cats.ApplicativeError
+import cats.{Applicative, ApplicativeError, Eq, Foldable, Show}
 import cats.instances.list._
 import cats.syntax.foldable._
 import cats.syntax.show._
-import cats.{Applicative, Foldable, Show}
+import fs2.kafka.consumer.KafkaCommit
 import fs2.kafka.instances._
 import fs2.kafka.internal.syntax._
 import org.apache.kafka.clients.consumer.OffsetAndMetadata
@@ -37,22 +37,6 @@ import org.apache.kafka.common.TopicPartition
 sealed abstract class CommittableOffsetBatch[F[_]] {
 
   /**
-    * Creates a new [[CommittableOffsetBatch]] with the specified offset
-    * included. Note that this function requires offsets to be in-order
-    * per topic-partition, as provided offsets will override existing
-    * offsets for the same topic-partition.
-    */
-  def updated(that: CommittableOffset[F]): CommittableOffsetBatch[F]
-
-  /**
-    * Creates a new [[CommittableOffsetBatch]] with the specified offsets
-    * included. Note that this function requires offsets to be in-order
-    * per topic-partition, as provided offsets will override existing
-    * offsets for the same topic-partition.
-    */
-  def updated(that: CommittableOffsetBatch[F]): CommittableOffsetBatch[F]
-
-  /**
     * The offsets included in the [[CommittableOffsetBatch]].
     */
   def offsets: Map[TopicPartition, OffsetAndMetadata]
@@ -68,31 +52,9 @@ sealed abstract class CommittableOffsetBatch[F[_]] {
     * IDs, have accidentally been mixed. The set might also be
     * empty if no consumer group IDs have been specified.
     */
-  def consumerGroupIds: Set[String]
+  def consumerGroupId: String // ???
 
-  /**
-    * `true` if any offset in the batch came from a consumer
-    * without a group ID; `false` otherwise. For the batch to
-    * be valid and for [[commit]] to succeed, this flag must
-    * be `false` and there should be exactly one consumer
-    * group ID in [[consumerGroupIds]].
-    */
-  def consumerGroupIdsMissing: Boolean
-
-  /**
-    * Commits the [[offsets]] to Kafka in a single commit.
-    * For the batch to be valid and for commit to succeed,
-    * the following conditions must hold:<br>
-    * - [[consumerGroupIdsMissing]] must be false, and<br>
-    * - [[consumerGroupIds]] must have exactly one ID.<br>
-    * <br>
-    * If one of the conditions above do not hold, there will
-    * be a [[ConsumerGroupException]] exception raised and a
-    * commit will not be attempted. If [[offsets]] is empty
-    * then these conditions do not need to hold, as there
-    * is nothing to commit.
-    */
-  def commit: F[Unit]
+  def committer: KafkaCommit[F]
 }
 
 object CommittableOffsetBatch {
@@ -100,12 +62,12 @@ object CommittableOffsetBatch {
     offsets: Map[TopicPartition, OffsetAndMetadata],
     consumerGroupIds: Set[String],
     consumerGroupIdsMissing: Boolean,
-    commit: Map[TopicPartition, OffsetAndMetadata] => F[Unit]
-  )(implicit F: ApplicativeError[F, Throwable]): CommittableOffsetBatch[F] = {
+    committer: KafkaCommit[F]
+  ): CommittableOffsetBatch[F] = {
     val _offsets = offsets
     val _consumerGroupIds = consumerGroupIds
     val _consumerGroupIdsMissing = consumerGroupIdsMissing
-    val _commit = commit
+    val _committer = committer
 
     new CommittableOffsetBatch[F] {
       override def updated(that: CommittableOffset[F]): CommittableOffsetBatch[F] =
@@ -113,7 +75,7 @@ object CommittableOffsetBatch {
           _offsets.updated(that.topicPartition, that.offsetAndMetadata),
           that.consumerGroupId.fold(_consumerGroupIds)(_consumerGroupIds + _),
           _consumerGroupIdsMissing || that.consumerGroupId.isEmpty,
-          _commit
+          committer
         )
 
       override def updated(that: CommittableOffsetBatch[F]): CommittableOffsetBatch[F] =
@@ -121,7 +83,7 @@ object CommittableOffsetBatch {
           _offsets ++ that.offsets,
           _consumerGroupIds ++ that.consumerGroupIds,
           _consumerGroupIdsMissing || that.consumerGroupIdsMissing,
-          _commit
+          committer
         )
 
       override val offsets: Map[TopicPartition, OffsetAndMetadata] =
@@ -133,14 +95,49 @@ object CommittableOffsetBatch {
       override val consumerGroupIdsMissing: Boolean =
         _consumerGroupIdsMissing
 
-      override def commit: F[Unit] =
-        if (_consumerGroupIdsMissing || _consumerGroupIds.size != 1)
-          F.raiseError(ConsumerGroupException(consumerGroupIds))
-        else _commit(offsets)
+      override def committer: KafkaCommit[F] =
+        _committer
 
       override def toString: String =
         Show[CommittableOffsetBatch[F]].show(this)
     }
+  }
+
+  implicit class CommittableOffsetBatchOps[F[_]](val self: CommittableOffsetBatch[F]) extends AnyVal {
+
+    /**
+      * Creates a new [[CommittableOffsetBatch]] with the specified offset
+      * included. Note that this function requires offsets to be in-order
+      * per topic-partition, as provided offsets will override existing
+      * offsets for the same topic-partition.
+      */
+    def updated(that: CommittableOffset[F]): CommittableOffsetBatch[F]
+
+    /**
+      * Creates a new [[CommittableOffsetBatch]] with the specified offsets
+      * included. Note that this function requires offsets to be in-order
+      * per topic-partition, as provided offsets will override existing
+      * offsets for the same topic-partition.
+      */
+    def updated(that: CommittableOffsetBatch[F]): CommittableOffsetBatch[F]
+
+    /**
+      * Commits the [[offsets]] to Kafka in a single commit.
+      * For the batch to be valid and for commit to succeed,
+      * the following conditions must hold:<br>
+      * - [[consumerGroupIdsMissing]] must be false, and<br>
+      * - [[consumerGroupIds]] must have exactly one ID.<br>
+      * <br>
+      * If one of the conditions above do not hold, there will
+      * be a [[ConsumerGroupException]] exception raised and a
+      * commit will not be attempted. If [[offsets]] is empty
+      * then these conditions do not need to hold, as there
+      * is nothing to commit.
+      */
+    def commit(implicit F: ApplicativeError[F, Throwable]): F[Unit] =
+      if (self.consumerGroupIdsMissing || self.consumerGroupIds.size != 1)
+        F.raiseError(ConsumerGroupException(self.consumerGroupIds))
+      else self.committer.commitInternal(self.offsets)
   }
 
   /**
@@ -303,5 +300,14 @@ object CommittableOffsetBatch {
           end = ")"
         )
       }
+    }
+
+  implicit def committableOffsetBatchEq[F[_]]: Eq[CommittableOffsetBatch[F]] =
+    Eq.instance {
+      case (l, r) =>
+        l.topicPartition == r.topicPartition &&
+          l.offsetAndMetadata == r.offsetAndMetadata &&
+          l.consumerGroupId == r.consumerGroupId &&
+          l.committer.eq(r.committer)
     }
 }

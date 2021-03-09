@@ -9,6 +9,7 @@ package fs2.kafka
 import cats.{ApplicativeError, Eq, Show}
 import cats.instances.string._
 import cats.syntax.show._
+import fs2.kafka.consumer.KafkaCommit
 import fs2.kafka.instances._
 import org.apache.kafka.clients.consumer.OffsetAndMetadata
 import org.apache.kafka.common.TopicPartition
@@ -62,20 +63,7 @@ sealed abstract class CommittableOffset[F[_]] {
     */
   def batch: CommittableOffsetBatch[F]
 
-  /**
-    * Commits the [[offsetAndMetadata]] for the [[topicPartition]] to
-    * Kafka. Note that offsets are normally committed in batches for
-    * performance reasons. Prefer pipes like [[commitBatchWithin]]
-    * or [[CommittableOffsetBatch]] for that reason.
-    */
-  def commit: F[Unit]
-
-  /**
-    * The commit function we are using in [[commit]] to commit the
-    * [[offsetAndMetadata]] for the [[topicPartition]]. Is used to
-    * help achieve better performance when batching offsets.
-    */
-  private[kafka] def commitOffsets: Map[TopicPartition, OffsetAndMetadata] => F[Unit]
+  def committer: KafkaCommit[F]
 }
 
 object CommittableOffset {
@@ -89,12 +77,12 @@ object CommittableOffset {
     topicPartition: TopicPartition,
     offsetAndMetadata: OffsetAndMetadata,
     consumerGroupId: Option[String],
-    commit: Map[TopicPartition, OffsetAndMetadata] => F[Unit]
+    committer: KafkaCommit[F]
   )(implicit F: ApplicativeError[F, Throwable]): CommittableOffset[F] = {
     val _topicPartition = topicPartition
     val _offsetAndMetadata = offsetAndMetadata
     val _consumerGroupId = consumerGroupId
-    val _commit = commit
+    val _committer = committer
 
     new CommittableOffset[F] {
       override val topicPartition: TopicPartition =
@@ -109,14 +97,11 @@ object CommittableOffset {
       override def offsets: Map[TopicPartition, OffsetAndMetadata] =
         Map(_topicPartition -> _offsetAndMetadata)
 
+      override def committer: KafkaCommit[F] =
+        _committer
+
       override def batch: CommittableOffsetBatch[F] =
-        CommittableOffsetBatch(offsets, consumerGroupId.toSet, consumerGroupId.isEmpty, _commit)
-
-      override def commit: F[Unit] =
-        _commit(offsets)
-
-      override val commitOffsets: Map[TopicPartition, OffsetAndMetadata] => F[Unit] =
-        _commit
+        CommittableOffsetBatch(offsets, consumerGroupId.toSet, consumerGroupId.isEmpty, committer)
 
       override def toString: String =
         consumerGroupId match {
@@ -128,6 +113,25 @@ object CommittableOffset {
     }
   }
 
+  implicit class CommittableOffsetOps[F[_]](val self: CommittableOffset[F]) extends AnyVal {
+    /**
+      * Commits the [[offsetAndMetadata]] for the [[topicPartition]] to
+      * Kafka. Note that offsets are normally committed in batches for
+      * performance reasons. Prefer pipes like [[commitBatchWithin]]
+      * or [[CommittableOffsetBatch]] for that reason.
+      */
+    def commit: F[Unit] =
+      self.committer.commitInternal(self.offsets)
+
+    /**
+      * The commit function we are using in [[commit]] to commit the
+      * [[offsetAndMetadata]] for the [[topicPartition]]. Is used to
+      * help achieve better performance when batching offsets.
+      */
+    private[kafka] def commitOffsets: Map[TopicPartition, OffsetAndMetadata] => F[Unit] =
+      self.committer.commitInternal
+  }
+
   implicit def committableOffsetShow[F[_]]: Show[CommittableOffset[F]] =
     Show.fromToString
 
@@ -136,6 +140,7 @@ object CommittableOffset {
       case (l, r) =>
         l.topicPartition == r.topicPartition &&
           l.offsetAndMetadata == r.offsetAndMetadata &&
-          l.consumerGroupId == r.consumerGroupId
+          l.consumerGroupId == r.consumerGroupId &&
+          l.committer.eq(r.committer)
     }
 }
